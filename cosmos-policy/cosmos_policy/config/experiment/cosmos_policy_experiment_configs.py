@@ -388,6 +388,10 @@ lehome_train_dataset = L(LeHomeDataset)(
     normalize_actions=True,
     num_duplicates_per_image=4,
     demonstration_sampling_prob=0.75,
+    use_wrist_images=False,
+    use_third_person_images=True,
+    use_proprio=True,
+    return_value_function_returns=False,
 )
 lehome_validation_dataset = L(LeHomeDataset)(
     data_dir=lehome_data_dir,

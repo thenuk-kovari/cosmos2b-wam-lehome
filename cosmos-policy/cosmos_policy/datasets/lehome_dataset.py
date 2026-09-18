@@ -127,6 +127,17 @@ class LeHomeDataset(Dataset):
         num_duplicates_per_image: int = 4,
         demonstration_sampling_prob: float = 0.75,
         debug: bool = False,
+        # Compatibility options inherited when Hydra recursively merges this
+        # dataset over the LIBERO experiment. LeHome always uses proprio and
+        # its three fixed cameras, and does not load rollout/value targets.
+        use_wrist_images: bool = False,
+        use_third_person_images: bool = True,
+        use_proprio: bool = True,
+        rollout_data_dir: str = "",
+        success_rollout_sampling_prob: float = 0.5,
+        treat_success_rollouts_as_demos: bool = False,
+        return_value_function_returns: bool = False,
+        gamma: float = 0.99,
     ) -> None:
         if split not in {"train", "validation"}:
             raise ValueError(f"split must be 'train' or 'validation', got {split!r}")
@@ -146,6 +157,20 @@ class LeHomeDataset(Dataset):
         self.demonstration_sampling_prob = demonstration_sampling_prob
         self.debug = debug
         self._video_readers: dict[str, _PyAVVideoReader] = {}
+
+        # These arguments deliberately have no effect for LeHome. Keeping them
+        # in the signature makes the adapter safe to instantiate from the
+        # recursively composed Cosmos Policy experiment config.
+        del (
+            use_wrist_images,
+            use_third_person_images,
+            use_proprio,
+            rollout_data_dir,
+            success_rollout_sampling_prob,
+            treat_success_rollouts_as_demos,
+            return_value_function_returns,
+            gamma,
+        )
 
         if not self.data_dir.is_dir():
             raise FileNotFoundError(f"LeHome data directory does not exist: {self.data_dir}")
