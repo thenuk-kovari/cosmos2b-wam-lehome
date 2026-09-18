@@ -426,6 +426,14 @@ cosmos_predict2_2b_480p_lehome_100_demos_no_value = LazyDict(
             f_max=[1.0, 0.06],
             f_min=[0.3, 0.06],
         ),
+        checkpoint=dict(
+            save_iter=1000,
+            save_to_object_store=dict(
+                enabled=True,
+                bucket="policy-training",
+                credentials="credentials/aws_default_chain.json",
+            ),
+        ),
         model=L(CosmosPolicyVideo2WorldModel)(
             config=dict(
                 state_t=10,
@@ -467,6 +475,8 @@ cosmos_predict2_2b_480p_lehome_100_demos_no_value = LazyDict(
             drop_last=False,
         ),
         job=dict(
+            project="cosmos2b-wam-lehome",
+            wandb_mode="online",
             group="cosmos_v2_finetune",
             name="cosmos_predict2_2b_480p_lehome_100_demos_no_value",
         ),

@@ -13,10 +13,10 @@ import os
 import pickle
 from pathlib import Path
 
+import av
 import numpy as np
 import pyarrow.parquet as pq
 import torch
-from decord import VideoReader, cpu
 from filelock import FileLock
 from torch.utils.data import Dataset
 
@@ -40,6 +40,57 @@ TRAIN_VARIANTS = ("001", "002", "003", "004", "005")
 VALIDATION_VARIANTS = ("001", "003", "005")
 TRAIN_EPISODES = (0, 1, 2, 3, 4)
 VALIDATION_EPISODES = (24,)
+
+
+class _PyAVVideoReader:
+    """Small seekable reader for LeHome's AV1-in-MP4 camera streams."""
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self.container = av.open(path)
+        self.stream = self.container.streams.video[0]
+        rate = self.stream.average_rate or self.stream.guessed_rate
+        if rate is None or self.stream.time_base is None:
+            raise RuntimeError(f"Missing frame-rate metadata in {path}")
+        self.fps = float(rate)
+        self.time_base = float(self.stream.time_base)
+        self.start_pts = self.stream.start_time or 0
+        self.length = int(self.stream.frames)
+        if self.length <= 0 and self.stream.duration is not None:
+            self.length = int(round(self.stream.duration * self.time_base * self.fps))
+        if self.length <= 0:
+            raise RuntimeError(f"Missing frame-count metadata in {path}")
+
+    def __len__(self) -> int:
+        return self.length
+
+    def get_batch(self, indices: list[int]) -> np.ndarray:
+        requested = [int(index) for index in indices]
+        if not requested:
+            raise ValueError("At least one video frame index is required")
+        if min(requested) < 0 or max(requested) >= self.length:
+            raise IndexError(f"Video indices {requested} are out of range for {self.path} ({self.length} frames)")
+
+        first_index = min(requested)
+        last_index = max(requested)
+        seek_pts = self.start_pts + round(first_index / self.fps / self.time_base)
+        self.container.seek(seek_pts, stream=self.stream, backward=True, any_frame=False)
+
+        wanted = set(requested)
+        decoded = {}
+        for frame in self.container.decode(self.stream):
+            if frame.pts is None:
+                continue
+            frame_index = round((frame.pts - self.start_pts) * self.time_base * self.fps)
+            if frame_index in wanted:
+                decoded[frame_index] = frame.to_ndarray(format="rgb24")
+            if frame_index >= last_index and wanted.issubset(decoded):
+                break
+
+        missing = wanted - decoded.keys()
+        if missing:
+            raise RuntimeError(f"Could not decode video indices {sorted(missing)} from {self.path}")
+        return np.stack([decoded[index] for index in requested])
 
 
 def _scale_to_unit_range(values: np.ndarray, low: np.ndarray, high: np.ndarray) -> np.ndarray:
@@ -94,7 +145,7 @@ class LeHomeDataset(Dataset):
         self.num_duplicates_per_image = num_duplicates_per_image
         self.demonstration_sampling_prob = demonstration_sampling_prob
         self.debug = debug
-        self._video_readers: dict[str, VideoReader] = {}
+        self._video_readers: dict[str, _PyAVVideoReader] = {}
 
         if not self.data_dir.is_dir():
             raise FileNotFoundError(f"LeHome data directory does not exist: {self.data_dir}")
@@ -265,9 +316,9 @@ class LeHomeDataset(Dataset):
             "actions_max": actions_max,
         }
 
-    def _get_video_reader(self, path: str) -> VideoReader:
+    def _get_video_reader(self, path: str) -> _PyAVVideoReader:
         if path not in self._video_readers:
-            self._video_readers[path] = VideoReader(path, ctx=cpu(0), num_threads=1)
+            self._video_readers[path] = _PyAVVideoReader(path)
         return self._video_readers[path]
 
     def _read_current_and_future_frames(self, episode: dict, current: int, future: int) -> dict[str, np.ndarray]:
@@ -277,7 +328,7 @@ class LeHomeDataset(Dataset):
             reader = self._get_video_reader(path)
             if source_indices[-1] >= len(reader):
                 raise IndexError(f"Video index {source_indices[-1]} is out of range for {path} ({len(reader)} frames)")
-            decoded = reader.get_batch(source_indices).asnumpy()
+            decoded = reader.get_batch(source_indices)
             result[f"{camera_name}_current"] = decoded[0]
             result[f"{camera_name}_future"] = decoded[1]
         return result
