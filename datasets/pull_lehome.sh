@@ -25,11 +25,28 @@ for task in "${tasks[@]}"; do
 done
 
 mkdir -p "${target_dir}"
-HF_XET_HIGH_PERFORMANCE=1 hf download lehome/dataset_challenge \
-    --repo-type dataset \
-    --revision main \
-    --local-dir "${target_dir}" \
-    --max-workers 4 \
-    "${include_args[@]}"
 
-echo "LeHome source variants downloaded to ${target_dir}"
+max_attempts="${HF_DOWNLOAD_ATTEMPTS:-12}"
+max_workers="${HF_DOWNLOAD_WORKERS:-8}"
+for ((attempt = 1; attempt <= max_attempts; attempt++)); do
+    if HF_XET_HIGH_PERFORMANCE=1 hf download lehome/dataset_challenge \
+        --repo-type dataset \
+        --revision main \
+        --local-dir "${target_dir}" \
+        --max-workers "${max_workers}" \
+        "${include_args[@]}"; then
+        echo "LeHome source variants downloaded to ${target_dir}"
+        exit 0
+    fi
+
+    if ((attempt == max_attempts)); then
+        break
+    fi
+    delay=$((attempt * 30))
+    ((delay > 300)) && delay=300
+    echo "Hugging Face download attempt ${attempt}/${max_attempts} failed; retrying in ${delay}s" >&2
+    sleep "${delay}"
+done
+
+echo "error: LeHome download failed after ${max_attempts} attempts" >&2
+exit 1

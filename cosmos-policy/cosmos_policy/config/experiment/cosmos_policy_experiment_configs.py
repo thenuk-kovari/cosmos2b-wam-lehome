@@ -23,6 +23,7 @@ from cosmos_policy._src.imaginaire.lazy_config import LazyDict
 from cosmos_policy._src.imaginaire.utils import log
 from cosmos_policy._src.imaginaire.utils.checkpoint_db import get_checkpoint_path  # noqa: F401
 from cosmos_policy.datasets.aloha_dataset import ALOHADataset
+from cosmos_policy.datasets.lehome_dataset import LeHomeDataset
 from cosmos_policy.datasets.libero_dataset import LIBERODataset
 from cosmos_policy.datasets.robocasa_dataset import RoboCasaDataset
 from cosmos_policy.models.policy_video2world_model import CosmosPolicyVideo2WorldModel
@@ -370,6 +371,109 @@ cosmos_predict2_2b_480p_aloha_185_demos_4_tasks_mixture_foldshirt15_candiesinbow
 )
 
 
+# LeHome folding policy: 100 train demonstrations, 12 held-out validation episodes.
+lehome_data_dir = os.path.join(BASE_DATASETS_DIR, "lehome")
+lehome_t5_embeddings_path = os.path.join(lehome_data_dir, "t5_embeddings.pkl")
+lehome_stats_path = os.path.join(lehome_data_dir, "lehome_cosmos_stats.json")
+
+lehome_train_dataset = L(LeHomeDataset)(
+    data_dir=lehome_data_dir,
+    split="train",
+    t5_text_embeddings_path=lehome_t5_embeddings_path,
+    stats_path=lehome_stats_path,
+    chunk_size=60,
+    use_image_aug=True,
+    use_stronger_image_aug=True,
+    normalize_proprio=True,
+    normalize_actions=True,
+    num_duplicates_per_image=4,
+    demonstration_sampling_prob=0.75,
+)
+lehome_validation_dataset = L(LeHomeDataset)(
+    data_dir=lehome_data_dir,
+    split="validation",
+    t5_text_embeddings_path=lehome_t5_embeddings_path,
+    stats_path=lehome_stats_path,
+    chunk_size=60,
+    use_image_aug=False,
+    use_stronger_image_aug=False,
+    normalize_proprio=True,
+    normalize_actions=True,
+    num_duplicates_per_image=4,
+    demonstration_sampling_prob=0.75,
+)
+
+cosmos_predict2_2b_480p_lehome_100_demos_no_value = LazyDict(
+    dict(
+        defaults=[
+            "/experiment/cosmos_predict2_2b_480p_libero",
+            "_self_",
+        ],
+        trainer=dict(
+            run_validation=True,
+            run_validation_on_start=False,
+            validation_iter=5000,
+            max_val_iter=None,
+            max_iter=50000,
+        ),
+        optimizer=dict(
+            lr=1e-4,
+        ),
+        scheduler=dict(
+            cycle_lengths=[20000, 100000000000000],
+            warm_up_steps=[2000, 0],
+            f_start=[1e-6, 0.06],
+            f_max=[1.0, 0.06],
+            f_min=[0.3, 0.06],
+        ),
+        model=L(CosmosPolicyVideo2WorldModel)(
+            config=dict(
+                state_t=10,
+                min_num_conditional_frames=5,
+                max_num_conditional_frames=5,
+                tokenizer=dict(
+                    chunk_duration=37,
+                ),
+            ),
+        ),
+        dataloader_train=L(DataLoader)(
+            num_workers=12,
+            persistent_workers=True,
+            pin_memory=True,
+            dataset=lehome_train_dataset,
+            sampler=L(DistributedSampler)(
+                dataset=lehome_train_dataset,
+                num_replicas=L(parallel_state.get_data_parallel_world_size)(),
+                rank=L(parallel_state.get_data_parallel_rank)(),
+                shuffle=True,
+                seed=0,
+            ),
+            batch_size=25,
+            drop_last=True,
+        ),
+        dataloader_val=L(DataLoader)(
+            num_workers=4,
+            persistent_workers=True,
+            pin_memory=True,
+            dataset=lehome_validation_dataset,
+            sampler=L(DistributedSampler)(
+                dataset=lehome_validation_dataset,
+                num_replicas=L(parallel_state.get_data_parallel_world_size)(),
+                rank=L(parallel_state.get_data_parallel_rank)(),
+                shuffle=False,
+                seed=0,
+            ),
+            batch_size=25,
+            drop_last=False,
+        ),
+        job=dict(
+            group="cosmos_v2_finetune",
+            name="cosmos_predict2_2b_480p_lehome_100_demos_no_value",
+        ),
+    )
+)
+
+
 # ALOHA planning model
 # Dataset: 648 rollouts from evaluations with Cosmos Policy, pi05, pi0, OpenVLA-OFT+, Diffusion Policy
 # NOTE: This rollouts dataset is not released; you will need to replace `rollout_data_dir` below with your own rollouts dataset
@@ -472,6 +576,8 @@ def register_configs():
         # RoboCasa
         cosmos_predict2_2b_480p_robocasa_50_demos_per_task,  # *** Main checkpoint ***
         cosmos_predict2_2b_480p_robocasa_50_demos_per_task__inference,
+        # LeHome
+        cosmos_predict2_2b_480p_lehome_100_demos_no_value,
         # ALOHA
         cosmos_predict2_2b_480p_aloha_185_demos_4_tasks_mixture_foldshirt15_candiesinbowl45_candyinbag45_eggplantchickenonplate80,  # *** Main checkpoint ***
         cosmos_predict2_2b_480p_aloha_185_demos_4_tasks_mixture_foldshirt15_candiesinbowl45_candyinbag45_eggplantchickenonplate80__inference_only,

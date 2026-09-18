@@ -397,10 +397,15 @@ class CosmosPolicyDiffusionModel(BaseDiffusionModel):
                 future_proprio,
                 proprio_indices=future_proprio_indices,
             )
-        # Value
-        x0_B_C_T_H_W[batch_indices, :, value_indices, :, :] = (
-            value_function_return.reshape(-1, 1, 1, 1).expand(-1, C_latent, H_latent, W_latent).to(x0_B_C_T_H_W.dtype)
-        )
+        # Value. A value index of -1 means this dataset has no value modality;
+        # never let it alias the final latent frame.
+        has_value_latent = torch.all(value_indices != -1)
+        if has_value_latent:
+            x0_B_C_T_H_W[batch_indices, :, value_indices, :, :] = (
+                value_function_return.reshape(-1, 1, 1, 1)
+                .expand(-1, C_latent, H_latent, W_latent)
+                .to(x0_B_C_T_H_W.dtype)
+            )
 
         # Get the mean and stand deviation of the marginal probability distribution.
         mean_B_C_T_H_W, std_B_T = self.sde.marginal_prob(x0_B_C_T_H_W, sigma_B_T)
@@ -647,21 +652,30 @@ class CosmosPolicyDiffusionModel(BaseDiffusionModel):
         all_samples_action_mse_loss = (action_diff**2).mean()
         all_samples_action_l1_loss = torch.abs(action_diff).mean()
 
-        # Get losses for value function prediction
-        value_diff = (
-            x0_B_C_T_H_W[batch_indices, :, value_indices, :, :] - model_pred.x0[batch_indices, :, value_indices, :, :]
-        )
-        value_diff_demo = value_diff[rollout_data_mask == 0]
-        value_diff_world_model = value_diff[world_model_sample_mask == 1]
-        value_diff_value_function = value_diff[value_function_sample_mask == 1]
-        demo_sample_value_mse_loss = (value_diff_demo**2).mean()
-        demo_sample_value_l1_loss = torch.abs(value_diff_demo).mean()
-        world_model_sample_value_mse_loss = (value_diff_world_model**2).mean()
-        world_model_sample_value_l1_loss = torch.abs(value_diff_world_model).mean()
-        value_function_sample_value_mse_loss = (value_diff_value_function**2).mean()
-        value_function_sample_value_l1_loss = torch.abs(value_diff_value_function).mean()
-        all_samples_value_mse_loss = (value_diff**2).mean()
-        all_samples_value_l1_loss = torch.abs(value_diff).mean()
+        # Keep the callback keys for compatibility, but report NaN when the
+        # sequence has no value latent.
+        if has_value_latent:
+            value_diff = (
+                x0_B_C_T_H_W[batch_indices, :, value_indices, :, :]
+                - model_pred.x0[batch_indices, :, value_indices, :, :]
+            )
+            value_diff_demo = value_diff[rollout_data_mask == 0]
+            value_diff_world_model = value_diff[world_model_sample_mask == 1]
+            value_diff_value_function = value_diff[value_function_sample_mask == 1]
+            demo_sample_value_mse_loss = (value_diff_demo**2).mean()
+            demo_sample_value_l1_loss = torch.abs(value_diff_demo).mean()
+            world_model_sample_value_mse_loss = (value_diff_world_model**2).mean()
+            world_model_sample_value_l1_loss = torch.abs(value_diff_world_model).mean()
+            value_function_sample_value_mse_loss = (value_diff_value_function**2).mean()
+            value_function_sample_value_l1_loss = torch.abs(value_diff_value_function).mean()
+        else:
+            nan = torch.tensor(float("nan"), device=x0_B_C_T_H_W.device)
+            demo_sample_value_mse_loss = nan
+            demo_sample_value_l1_loss = nan
+            world_model_sample_value_mse_loss = nan
+            world_model_sample_value_l1_loss = nan
+            value_function_sample_value_mse_loss = nan
+            value_function_sample_value_l1_loss = nan
 
         output_batch = {
             "x0": x0_B_C_T_H_W,
