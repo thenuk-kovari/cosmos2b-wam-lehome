@@ -34,6 +34,7 @@ from cosmos_policy._src.imaginaire.serialization import to_yaml
 from cosmos_policy._src.imaginaire.utils import distributed
 from cosmos_policy._src.imaginaire.utils.context_managers import data_loader_init, distributed_init, model_init
 from cosmos_policy._src.imaginaire.utils.launch import log_reproducible_setup
+from cosmos_policy._src.predict2.utils.model_loader import create_model_from_consolidated_checkpoint_with_fsdp
 
 
 @logging.catch(reraise=True)
@@ -46,14 +47,21 @@ def launch(config: Config, args: argparse.Namespace) -> None:
 
     # Check that the config is valid
     config.validate()
-    # Freeze the config so developers don't change it during training.
-    config.freeze()  # type: ignore
     trainer = config.trainer.type(config)
     # Setup the miscellaneous stuff for reproducibility.
     log_reproducible_setup(config, args)
 
     with model_init():
-        model = instantiate(config.model)
+        if str(config.checkpoint.load_path).endswith(".pt"):
+            # DCP deliberately skips consolidated .pt checkpoints. Load the
+            # pretrained weights before applying FSDP instead.
+            model = create_model_from_consolidated_checkpoint_with_fsdp(config)
+        else:
+            model = instantiate(config.model)
+
+    # The consolidated loader temporarily changes the FSDP shard size, so the
+    # config can only be frozen after model initialization.
+    config.freeze()  # type: ignore
 
     # Create the dataloaders.
     with data_loader_init():
