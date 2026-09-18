@@ -1,0 +1,55 @@
+{
+  "source": {
+    "repo_id": "lehome/dataset_challenge",
+    "repo_type": "dataset",
+    "revision": "main",
+    "fps": 30,
+    "variants_to_download": ["001", "002", "003", "004", "005"]
+  },
+  "tasks": {
+    "record_pant_long_release_10": "fold the pants",
+    "record_pant_short_release_10": "fold the shorts",
+    "record_top_long_release_10": "fold the shirt",
+    "record_top_short_release_10": "fold the t-shirt"
+  },
+  "cameras": [
+    "observation.images.left_rgb",
+    "observation.images.right_rgb",
+    "observation.images.top_rgb"
+  ],
+  "splits": {
+    "train": {
+      "variants": ["001", "002", "003", "004", "005"],
+      "episode_indices": [0, 1, 2, 3, 4],
+      "episodes_per_task": 25,
+      "total_episodes": 100
+    },
+    "validation": {
+      "variants": ["001", "003", "005"],
+      "episode_indices": [24],
+      "episodes_per_task": 3,
+      "total_episodes": 12
+    }
+  },
+  "action_chunk": {
+    "source": "observation.state",
+    "ignore_source_action": true,
+    "length": 60,
+    "duration_seconds": 2.0,
+    "targets": "q[min(t+j, T-1)] - q[t] for j=1..60",
+    "episode_end": "clamp indices to T-1",
+    "execution": "add each predicted delta to current q and execute all 60 targets"
+  },
+  "training_objectives": {
+    "policy_fraction": 0.75,
+    "future_state_fraction": 0.25,
+    "value_fraction": 0.0,
+    "mixing_scope": "constructed epoch, matching the existing loader"
+  },
+  "normalization": {
+    "fit_on": "training split only",
+    "proprio": "per-joint min/max of absolute observation.state",
+    "actions": "separate per-joint min/max of q0-anchored deltas across all chunk positions",
+    "range": [-1.0, 1.0]
+  }
+}

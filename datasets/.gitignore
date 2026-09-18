@@ -1,0 +1,6 @@
+# Keep downloaded dataset payloads out of Git.
+*
+!.gitignore
+!README.md
+!lehome_selection.json
+!pull_lehome.sh
