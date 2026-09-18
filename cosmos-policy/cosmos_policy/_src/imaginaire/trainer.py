@@ -351,3 +351,4 @@ class ImaginaireTrainer:
                 output_batch, loss = model.validation_step(data_batch, iteration)
                 self.callbacks.on_validation_step_end(model, data_batch, output_batch, loss, iteration=iteration)
         self.callbacks.on_validation_end(model, iteration=iteration)
+        model.train()

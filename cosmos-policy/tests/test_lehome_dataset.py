@@ -1,6 +1,10 @@
 import numpy as np
 
-from cosmos_policy.datasets.lehome_dataset import _anchored_delta_chunk, _scale_to_unit_range
+from cosmos_policy.datasets.lehome_dataset import (
+    _anchored_delta_chunk,
+    _apply_conditioning_dropout,
+    _scale_to_unit_range,
+)
 
 
 def test_anchored_delta_chunk_starts_at_executable_next_state():
@@ -28,3 +32,15 @@ def test_scale_to_unit_range_handles_constant_joints():
 
     np.testing.assert_allclose(scaled[:, 0], np.array([-1.0, 0.0, 1.0]))
     np.testing.assert_array_equal(scaled[:, 1], np.zeros(3, dtype=np.float32))
+
+
+def test_proprio_conditioning_dropout_preserves_or_zeros_vector():
+    proprio = np.array([0.25, -0.75], dtype=np.float32)
+
+    kept, kept_was_dropped = _apply_conditioning_dropout(proprio, 0.0)
+    dropped, dropped_was_dropped = _apply_conditioning_dropout(proprio, 1.0)
+
+    np.testing.assert_array_equal(kept, proprio)
+    assert not kept_was_dropped
+    np.testing.assert_array_equal(dropped, np.zeros_like(proprio))
+    assert dropped_was_dropped

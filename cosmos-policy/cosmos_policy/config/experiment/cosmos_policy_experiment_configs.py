@@ -388,6 +388,7 @@ lehome_train_dataset = L(LeHomeDataset)(
     normalize_actions=True,
     num_duplicates_per_image=4,
     demonstration_sampling_prob=0.75,
+    proprio_conditioning_dropout_prob=0.5,
     use_wrist_images=False,
     use_third_person_images=True,
     use_proprio=True,
@@ -405,6 +406,7 @@ lehome_validation_dataset = L(LeHomeDataset)(
     normalize_actions=True,
     num_duplicates_per_image=4,
     demonstration_sampling_prob=0.75,
+    proprio_conditioning_dropout_prob=0.0,
 )
 
 cosmos_predict2_2b_480p_lehome_100_demos_no_value = LazyDict(

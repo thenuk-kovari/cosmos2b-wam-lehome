@@ -97,6 +97,13 @@ class CosmosPolicyVideo2WorldModel(CosmosPolicyDiffusionModel):
         super().__init__(config)
         self.config: CosmosPolicyVideo2WorldConfig = config
 
+    @torch.no_grad()
+    def validation_step(
+        self, data_batch: dict[str, torch.Tensor], iteration: int
+    ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+        """Evaluate the policy diffusion objective instead of sampling video."""
+        return self.training_step(data_batch, iteration)
+
     def get_data_and_condition(
         self, data_batch: dict[str, torch.Tensor]
     ) -> Tuple[Tensor, Tensor, Video2WorldCondition]:

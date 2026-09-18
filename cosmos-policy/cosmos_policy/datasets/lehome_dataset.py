@@ -108,6 +108,12 @@ def _anchored_delta_chunk(states: np.ndarray, anchor: int, chunk_size: int) -> n
     return (states[future_indices] - states[anchor]).astype(np.float32, copy=False)
 
 
+def _apply_conditioning_dropout(values: np.ndarray, probability: float) -> tuple[np.ndarray, bool]:
+    """Randomly replace a conditioning vector with zeros."""
+    dropped = probability > 0.0 and torch.rand(()).item() < probability
+    return (np.zeros_like(values), True) if dropped else (values, False)
+
+
 class LeHomeDataset(Dataset):
     """Selected LeHome episodes in the latent-frame layout used by ALOHA."""
 
@@ -126,6 +132,7 @@ class LeHomeDataset(Dataset):
         use_stronger_image_aug: bool = True,
         num_duplicates_per_image: int = 4,
         demonstration_sampling_prob: float = 0.75,
+        proprio_conditioning_dropout_prob: float = 0.0,
         debug: bool = False,
         # Compatibility options inherited when Hydra recursively merges this
         # dataset over the LIBERO experiment. LeHome always uses proprio and
@@ -143,6 +150,8 @@ class LeHomeDataset(Dataset):
             raise ValueError(f"split must be 'train' or 'validation', got {split!r}")
         if not 0.0 < demonstration_sampling_prob < 1.0:
             raise ValueError("demonstration_sampling_prob must be strictly between 0 and 1")
+        if not 0.0 <= proprio_conditioning_dropout_prob <= 1.0:
+            raise ValueError("proprio_conditioning_dropout_prob must be between 0 and 1")
 
         self.data_dir = Path(data_dir)
         self.split = split
@@ -155,6 +164,7 @@ class LeHomeDataset(Dataset):
         self.use_stronger_image_aug = use_stronger_image_aug
         self.num_duplicates_per_image = num_duplicates_per_image
         self.demonstration_sampling_prob = demonstration_sampling_prob
+        self.proprio_conditioning_dropout_prob = proprio_conditioning_dropout_prob
         self.debug = debug
         self._video_readers: dict[str, _PyAVVideoReader] = {}
 
@@ -400,6 +410,12 @@ class LeHomeDataset(Dataset):
                 future_proprio, self.dataset_stats["proprio_min"], self.dataset_stats["proprio_max"]
             )
 
+        # Drop only the current proprio conditioning vector. Action and future
+        # proprio targets remain unchanged. Validation configures this as zero.
+        proprio, proprio_conditioning_dropped = _apply_conditioning_dropout(
+            proprio, self.proprio_conditioning_dropout_prob
+        )
+
         decoded = self._read_current_and_future_frames(episode, relative_step_idx, future_frame_idx)
         blank = np.zeros_like(decoded["top_current"])
         unique_frames = np.stack(
@@ -440,6 +456,7 @@ class LeHomeDataset(Dataset):
             "padding_mask": torch.zeros(1, self.final_image_size, self.final_image_size),
             "image_size": self.final_image_size * torch.ones(4),
             "proprio": proprio,
+            "proprio_conditioning_dropped": proprio_conditioning_dropped,
             "future_proprio": future_proprio,
             "__key__": idx,
             "value_function_return": 0.0,
