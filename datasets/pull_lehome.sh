@@ -16,19 +16,20 @@ tasks=(
     record_top_short_release_10
 )
 variants=(001 002 003 004 005)
-includes=()
+include_args=()
 
 for task in "${tasks[@]}"; do
     for variant in "${variants[@]}"; do
-        includes+=("${task}/${variant}/**")
+        include_args+=(--include "${task}/${variant}/**")
     done
 done
 
 mkdir -p "${target_dir}"
-hf download lehome/dataset_challenge \
+HF_XET_HIGH_PERFORMANCE=1 hf download lehome/dataset_challenge \
     --repo-type dataset \
     --revision main \
     --local-dir "${target_dir}" \
-    --include "${includes[@]}"
+    --max-workers 4 \
+    "${include_args[@]}"
 
 echo "LeHome source variants downloaded to ${target_dir}"
