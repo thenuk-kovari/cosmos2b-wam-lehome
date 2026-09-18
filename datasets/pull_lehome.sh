@@ -20,7 +20,7 @@ include_args=()
 
 for task in "${tasks[@]}"; do
     for variant in "${variants[@]}"; do
-        include_args+=(--include "${task}/${variant}/**")
+        include_args+=("${task}/${variant}/**")
     done
 done
 
@@ -34,6 +34,7 @@ for ((attempt = 1; attempt <= max_attempts; attempt++)); do
         --revision main \
         --local-dir "${target_dir}" \
         --max-workers "${max_workers}" \
+        --include \
         "${include_args[@]}"; then
         echo "LeHome source variants downloaded to ${target_dir}"
         exit 0

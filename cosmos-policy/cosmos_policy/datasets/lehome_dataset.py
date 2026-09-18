@@ -23,7 +23,6 @@ from torch.utils.data import Dataset
 from cosmos_policy.datasets.dataset_common import calculate_epoch_structure, determine_sample_type
 from cosmos_policy.datasets.dataset_utils import preprocess_image
 
-
 TASK_PROMPTS = {
     "record_pant_long_release_10": "fold the pants",
     "record_pant_short_release_10": "fold the shorts",
@@ -187,7 +186,9 @@ class LeHomeDataset(Dataset):
                     rows = selected[order]
                     expected_frames = np.arange(len(rows), dtype=np.int64)
                     if not np.array_equal(all_frame_indices[rows], expected_frames):
-                        raise RuntimeError(f"Non-contiguous frame_index values in {task}/{variant}/{source_episode_idx}")
+                        raise RuntimeError(
+                            f"Non-contiguous frame_index values in {task}/{variant}/{source_episode_idx}"
+                        )
 
                     episode_states = all_states[rows]
                     if episode_states.ndim != 2 or episode_states.shape[1] != 12:
