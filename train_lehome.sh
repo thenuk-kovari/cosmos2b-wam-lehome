@@ -54,4 +54,5 @@ exec "${docker_cmd[@]}" run --rm \
     -m cosmos_policy.scripts.train \
     --config=cosmos_policy/config/config.py -- \
     experiment=cosmos_predict2_2b_480p_lehome_100_demos_no_value \
+    job.name=cosmos_predict2_2b_480p_lehome_100_demos_no_value_from_base \
     "$@"

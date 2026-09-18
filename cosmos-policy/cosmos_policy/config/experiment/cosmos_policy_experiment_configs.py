@@ -482,7 +482,7 @@ cosmos_predict2_2b_480p_lehome_100_demos_no_value = LazyDict(
             project="cosmos2b-wam-lehome",
             wandb_mode="online",
             group="cosmos_v2_finetune",
-            name="cosmos_predict2_2b_480p_lehome_100_demos_no_value_from_base",
+            name="cosmos_predict2_2b_480p_lehome_100_demos_no_value",
         ),
     )
 )
