@@ -1,0 +1,22 @@
+[Unit]
+Description=Cosmos training Lambda Cloud termination watchdog
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/cosmos-training-watchdog.env
+EnvironmentFile=/etc/cosmos-training-watchdog.secret
+Environment=AWS_SHARED_CREDENTIALS_FILE=/home/ubuntu/.aws/credentials
+Environment=AWS_CONFIG_FILE=/home/ubuntu/.aws/config
+ExecStart=/usr/local/sbin/cosmos-training-watchdog
+Restart=on-failure
+RestartSec=15
+
+# The API key and state files are only accessible to root.
+User=root
+Group=root
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
