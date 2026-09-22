@@ -32,6 +32,7 @@ from cosmos_policy._src.imaginaire.utils.easy_io import easy_io
 def log_prof_data(
     data_list: List[Dict[str, Any]],
     iteration: int,
+    log_wandb_table: bool = True,
 ) -> Tuple[pd.DataFrame]:
     # Create a table to log data with rank information
     columns = ["iteration", "rank"] + list(data_list[0].keys())
@@ -62,9 +63,13 @@ def log_prof_data(
     summary_df = pd.DataFrame({"Avg": avg_values, "Max": max_values, "Min": min_values})
 
     if wandb.run:
-        # Log the table
-        table = wandb.Table(dataframe=df)
-        wandb.log({"DeviceMonitor/prof_data": table}, step=iteration)
+        # W&B tables are artifacts. Some W&B client/server combinations reject
+        # them with "Invalid Client ID digest", which blocks later scalar
+        # history in the sender queue. Scalar device summaries remain useful
+        # and do not require an artifact.
+        if log_wandb_table:
+            table = wandb.Table(dataframe=df)
+            wandb.log({"DeviceMonitor/prof_data": table}, step=iteration)
 
         # Log summary statistics
         summary = {}
@@ -94,6 +99,7 @@ class DeviceMonitor(EveryN):
         save_s3: bool = False,
         upload_every_n_mul: int = 1,
         log_memory_detail: bool = True,
+        log_wandb_table: bool = True,
     ):
         super().__init__(every_n=every_n, step_size=step_size)
         self.name = self.__class__.__name__
@@ -102,6 +108,7 @@ class DeviceMonitor(EveryN):
         self.upload_every_n = upload_every_n_mul * every_n
 
         self.log_memory_detail = log_memory_detail
+        self.log_wandb_table = log_wandb_table
 
     def on_train_start(self, model, iteration=0):
         torch.cuda.reset_peak_memory_stats()
@@ -162,7 +169,7 @@ class DeviceMonitor(EveryN):
             torch.distributed.all_gather_object(data_list, prof_data)
             torch.distributed.barrier()
 
-        df, summary_df = log_prof_data(data_list, iteration)
+        df, summary_df = log_prof_data(data_list, iteration, log_wandb_table=self.log_wandb_table)
         if self.save_s3 and self.rank == 0:
             global_step = iteration // self.step_size
             should_run = global_step % self.upload_every_n == 0

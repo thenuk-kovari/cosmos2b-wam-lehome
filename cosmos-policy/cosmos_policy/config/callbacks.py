@@ -38,13 +38,24 @@ class _LossRecordNoEDM:
         self.loss = 0
         self.iter_count = 0
 
-    def get_stat(self) -> Tuple[float, float]:
-        if self.iter_count > 0:
-            avg_loss = self.loss / self.iter_count
-            dist.all_reduce(avg_loss, op=dist.ReduceOp.AVG)
-            avg_loss = avg_loss.item()
+    def get_stat(self) -> float:
+        # Every rank must execute the same collective even when its local
+        # batch contains no samples for this metric. Conditional all-reduces
+        # corrupt metric ordering and eventually deadlock the next FSDP
+        # collective when demo/world-model mixtures differ across ranks.
+        if isinstance(self.loss, torch.Tensor):
+            loss_sum = self.loss.detach().to(dtype=torch.float32)
         else:
-            avg_loss = 0
+            device = (
+                torch.device("cuda", torch.cuda.current_device())
+                if torch.cuda.is_available()
+                else torch.device("cpu")
+            )
+            loss_sum = torch.tensor(float(self.loss), device=device, dtype=torch.float32)
+        stats = torch.stack((loss_sum, loss_sum.new_tensor(float(self.iter_count))))
+        dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+        global_count = stats[1].item()
+        avg_loss = stats[0].item() / global_count if global_count > 0 else 0.0
         self.reset()
         return avg_loss
 
@@ -55,6 +66,7 @@ class WandbCallback(WandBCallbackImage):
         logging_iter_multipler: int = 1,
         save_logging_iter_multipler: int = 1,
         save_s3: bool = False,
+        synchronize_ranks_after_step: bool = False,
     ) -> None:
         super().__init__()
         self.train_image_log = _LossRecord()
@@ -113,6 +125,7 @@ class WandbCallback(WandBCallbackImage):
         self.save_logging_iter_multipler = save_logging_iter_multipler
         assert self.logging_iter_multipler > 0, "logging_iter_multipler should be greater than 0"
         self.save_s3 = save_s3
+        self.synchronize_ranks_after_step = synchronize_ranks_after_step
         self.wandb_extra_tag = f"@{logging_iter_multipler}" if logging_iter_multipler > 1 else ""
         self.name = "wandb_loss_log" + self.wandb_extra_tag
 
@@ -365,6 +378,13 @@ class WandbCallback(WandBCallbackImage):
             # reset unstable count
             self.train_img_unstable_count.zero_()
             self.train_video_unstable_count.zero_()
+
+        # This callback reads CUDA tensors into Python on every rank. Without
+        # an end barrier, a faster rank can enter the next FSDP forward while
+        # a slower rank is still synchronizing a loss tensor here, producing
+        # a permanent collective-order deadlock.
+        if self.synchronize_ranks_after_step:
+            distributed.barrier()
 
     def on_validation_step_end(
         self,

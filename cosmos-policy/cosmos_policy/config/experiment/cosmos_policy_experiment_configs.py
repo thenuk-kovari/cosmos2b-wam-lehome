@@ -26,6 +26,19 @@ from cosmos_policy.datasets.aloha_dataset import ALOHADataset
 from cosmos_policy.datasets.lehome_dataset import LeHomeDataset
 from cosmos_policy.datasets.libero_dataset import LIBERODataset
 from cosmos_policy.datasets.robocasa_dataset import RoboCasaDataset
+from cosmos_policy.lehome_dual_endpoint_layout import (
+    ACTION_CHUNK_SIZE as LEHOME_DUAL_ENDPOINT_ACTION_CHUNK_SIZE,
+    NUM_CONDITIONAL_LATENTS as LEHOME_DUAL_ENDPOINT_NUM_CONDITIONAL_LATENTS,
+    RAW_SEQUENCE_FRAMES as LEHOME_DUAL_ENDPOINT_RAW_SEQUENCE_FRAMES,
+    STATE_T as LEHOME_DUAL_ENDPOINT_STATE_T,
+)
+from cosmos_policy.lehome_layout import (
+    ACTION_CHUNK_SIZE as LEHOME_ACTION_CHUNK_SIZE,
+    NUM_CONDITIONAL_LATENTS as LEHOME_NUM_CONDITIONAL_LATENTS,
+    RAW_SEQUENCE_FRAMES as LEHOME_RAW_SEQUENCE_FRAMES,
+    STATE_T as LEHOME_STATE_T,
+    VIDEO_FPS as LEHOME_VIDEO_FPS,
+)
 from cosmos_policy.models.policy_video2world_model import CosmosPolicyVideo2WorldModel
 from cosmos_policy.modules.hybrid_edm_sde import HybridEDMSDE
 
@@ -159,7 +172,10 @@ cosmos_predict2_2b_480p_libero = LazyDict(
             ),
         ),
         dataloader_train=L(DataLoader)(
-            num_workers=12,
+            # Each worker decodes three AV1 streams. Four workers per rank,
+            # paired with the dataset's bounded reader cache, avoids retaining
+            # hundreds of libdav1d decoder contexts across shuffled episodes.
+            num_workers=4,
             persistent_workers=True,
             pin_memory=True,
             dataset=libero_all_4_suites_dataset,
@@ -373,7 +389,10 @@ cosmos_predict2_2b_480p_aloha_185_demos_4_tasks_mixture_foldshirt15_candiesinbow
 
 # LeHome folding policy: 100 train demonstrations, 12 held-out validation episodes.
 lehome_data_dir = os.path.join(BASE_DATASETS_DIR, "lehome")
-lehome_t5_embeddings_path = os.path.join(lehome_data_dir, "t5_embeddings.pkl")
+lehome_t5_embeddings_path = os.environ.get(
+    "LEHOME_T5_EMBEDDINGS_PATH",
+    os.path.join(lehome_data_dir, "t5_embeddings.pkl"),
+)
 lehome_stats_path = os.path.join(lehome_data_dir, "lehome_cosmos_stats.json")
 
 lehome_train_dataset = L(LeHomeDataset)(
@@ -466,7 +485,7 @@ cosmos_predict2_2b_480p_lehome_100_demos_no_value = LazyDict(
             drop_last=True,
         ),
         dataloader_val=L(DataLoader)(
-            num_workers=4,
+            num_workers=2,
             persistent_workers=True,
             pin_memory=True,
             dataset=lehome_validation_dataset,
@@ -485,6 +504,480 @@ cosmos_predict2_2b_480p_lehome_100_demos_no_value = LazyDict(
             wandb_mode="online",
             group="cosmos_v2_finetune",
             name="cosmos_predict2_2b_480p_lehome_100_demos_no_value",
+        ),
+    )
+)
+
+
+# Value-free LeHome training in the exact Cosmos Policy ALOHA latent order:
+# blank, q, left, right, head, action, future q, future left, future right,
+# future head. Demo samples optimize only action; world-model samples optimize
+# only the four future-state latents. The action multiplier compensates for the
+# four state slots, preserving the requested 75% action / 25% state weighting.
+cosmos_predict2_2b_480p_lehome_100_demos_endpoint_dropout50 = LazyDict(
+    dict(
+        defaults=[
+            "/experiment/cosmos_predict2_2b_480p_lehome_100_demos_no_value",
+            "_self_",
+        ],
+        trainer=dict(
+            callbacks=dict(
+                compile_tokenizer=dict(enabled=False),
+                device_monitor=dict(log_wandb_table=False),
+                wandb=dict(synchronize_ranks_after_step=True),
+                wandb_10x=dict(synchronize_ranks_after_step=True),
+                every_n_sample_reg=dict(
+                    every_n=5000,
+                    save_s3=False,
+                    use_negative_prompt=False,
+                    guidance=[0],
+                    num_sampling_step=9,
+                    fps=16,
+                ),
+            ),
+            run_validation=True,
+            run_validation_on_start=False,
+            validation_iter=5000,
+            max_val_iter=None,
+            max_iter=50000,
+            # 6 x 2 accumulation x 8 GPUs = effective global batch 96.
+            grad_accum_iter=2,
+        ),
+        model=L(CosmosPolicyVideo2WorldModel)(
+            config=dict(
+                state_t=10,
+                min_num_conditional_frames=5,
+                max_num_conditional_frames=5,
+                tokenizer=dict(
+                    chunk_duration=37,
+                ),
+                mask_loss_for_action_future_state_prediction=True,
+                # A state sample has four supervised latent frames (6..9)
+                # versus one action latent (5). Compensate before applying
+                # the 75/25 sample mix so it is also the effective loss mix.
+                action_loss_multiplier=4,
+            ),
+        ),
+        dataloader_train=L(DataLoader)(
+            num_workers=12,
+            persistent_workers=True,
+            pin_memory=True,
+            dataset=lehome_train_dataset,
+            sampler=L(DistributedSampler)(
+                dataset=lehome_train_dataset,
+                num_replicas=L(parallel_state.get_data_parallel_world_size)(),
+                rank=L(parallel_state.get_data_parallel_rank)(),
+                shuffle=True,
+                seed=0,
+            ),
+            batch_size=6,
+            drop_last=True,
+        ),
+        dataloader_val=L(DataLoader)(
+            num_workers=4,
+            persistent_workers=True,
+            pin_memory=True,
+            dataset=lehome_validation_dataset,
+            sampler=L(DistributedSampler)(
+                dataset=lehome_validation_dataset,
+                num_replicas=L(parallel_state.get_data_parallel_world_size)(),
+                rank=L(parallel_state.get_data_parallel_rank)(),
+                shuffle=False,
+                seed=0,
+            ),
+            batch_size=6,
+            drop_last=False,
+        ),
+        job=dict(
+            project="cosmos2b-wam-lehome",
+            wandb_mode="online",
+            group="cosmos_v2_finetune",
+            name="cosmos_predict2_2b_480p_lehome_100_demos_endpoint_dropout50_prod_v1",
+        ),
+    )
+)
+
+
+# Paper joint objective, with the requested no-value 75/25 sampling split.
+# Policy: p(actions, future state | current state).
+# World model: p(future state | current state, ground-truth actions).
+# The 75/25 ratio selects conditioning patterns, NOT scalar loss weights.
+# All unconditioned latent elements use the original sigma-weighted EDM MSE.
+cosmos_predict2_2b_480p_lehome_100_demos_endpoint_jointloss_dropout50 = LazyDict(
+    dict(
+        defaults=[
+            "/experiment/cosmos_predict2_2b_480p_lehome_100_demos_endpoint_dropout50_prod_v1",
+            "_self_",
+        ],
+        model=L(CosmosPolicyVideo2WorldModel)(
+            config=dict(
+                mask_loss_for_action_future_state_prediction=False,
+                mask_value_prediction_loss_for_policy_prediction=False,
+                mask_current_state_action_for_value_prediction=False,
+                mask_future_state_for_qvalue_prediction=False,
+                action_loss_multiplier=1,
+            ),
+        ),
+        job=dict(
+            name="cosmos_predict2_2b_480p_lehome_100_demos_endpoint_jointloss_dropout50_prod_v2",
+        ),
+    )
+)
+
+
+# One-second action horizon at the dataset's 30 Hz control rate. This changes
+# only the q0-anchored action target length and its corresponding statistics;
+# the 10-slot latent layout and model/loss configuration are inherited intact.
+lehome_chunk30_stats_path = os.path.join(lehome_data_dir, "lehome_cosmos_stats_chunk30.json")
+lehome_chunk30_train_dataset = L(LeHomeDataset)(
+    data_dir=lehome_data_dir,
+    split="train",
+    t5_text_embeddings_path=lehome_t5_embeddings_path,
+    stats_path=lehome_chunk30_stats_path,
+    chunk_size=30,
+    use_image_aug=True,
+    use_stronger_image_aug=True,
+    normalize_proprio=True,
+    normalize_actions=True,
+    num_duplicates_per_image=4,
+    demonstration_sampling_prob=0.75,
+    proprio_conditioning_dropout_prob=0.5,
+    use_wrist_images=False,
+    use_third_person_images=True,
+    use_proprio=True,
+    return_value_function_returns=False,
+)
+lehome_chunk30_validation_dataset = L(LeHomeDataset)(
+    data_dir=lehome_data_dir,
+    split="validation",
+    t5_text_embeddings_path=lehome_t5_embeddings_path,
+    stats_path=lehome_chunk30_stats_path,
+    chunk_size=30,
+    use_image_aug=False,
+    use_stronger_image_aug=False,
+    normalize_proprio=True,
+    normalize_actions=True,
+    num_duplicates_per_image=4,
+    demonstration_sampling_prob=0.75,
+    proprio_conditioning_dropout_prob=0.0,
+)
+
+cosmos_predict2_2b_480p_lehome_100_demos_endpoint_jointloss_dropout50_chunk30 = LazyDict(
+    dict(
+        defaults=[
+            "/experiment/cosmos_predict2_2b_480p_lehome_100_demos_endpoint_jointloss_dropout50_prod_v2",
+            "_self_",
+        ],
+        dataloader_train=L(DataLoader)(
+            num_workers=12,
+            persistent_workers=True,
+            pin_memory=True,
+            dataset=lehome_chunk30_train_dataset,
+            sampler=L(DistributedSampler)(
+                dataset=lehome_chunk30_train_dataset,
+                num_replicas=L(parallel_state.get_data_parallel_world_size)(),
+                rank=L(parallel_state.get_data_parallel_rank)(),
+                shuffle=True,
+                seed=0,
+            ),
+            batch_size=6,
+            drop_last=True,
+        ),
+        dataloader_val=L(DataLoader)(
+            num_workers=4,
+            persistent_workers=True,
+            pin_memory=True,
+            dataset=lehome_chunk30_validation_dataset,
+            sampler=L(DistributedSampler)(
+                dataset=lehome_chunk30_validation_dataset,
+                num_replicas=L(parallel_state.get_data_parallel_world_size)(),
+                rank=L(parallel_state.get_data_parallel_rank)(),
+                shuffle=False,
+                seed=0,
+            ),
+            batch_size=6,
+            drop_last=False,
+        ),
+        job=dict(
+            name="cosmos_predict2_2b_480p_lehome_100_demos_endpoint_jointloss_dropout50_chunk30_prod_v3",
+        ),
+    )
+)
+
+cosmos_predict2_2b_480p_lehome_100_demos_endpoint_jointloss_dropout50_chunk30_inference = LazyDict(
+    dict(
+        defaults=[
+            "/experiment/cosmos_predict2_2b_480p_lehome_100_demos_endpoint_jointloss_dropout50_chunk30_prod_v3",
+            "_self_",
+        ],
+        model=L(CosmosPolicyVideo2WorldModel)(
+            config=dict(
+                sde=L(HybridEDMSDE)(sigma_max=80, sigma_min=4),
+            ),
+        ),
+        job=dict(
+            group="cosmos_v2_inference",
+            name="cosmos_predict2_2b_480p_lehome_100_demos_endpoint_jointloss_dropout50_chunk30_prod_v3_inference",
+        ),
+    )
+)
+
+# One-second action horizon with visual supervision at both 0.5 s and 1.0 s.
+# This changes only the input/target layout. It inherits the exact joint EDM
+# objective, 75/25 conditioning-pattern sampler, optimizer, scheduler, and
+# 50% current-proprio dropout from the proven one-second endpoint experiment.
+lehome_dual_endpoint_chunk30_train_dataset = L(LeHomeDataset)(
+    data_dir=lehome_data_dir,
+    split="train",
+    t5_text_embeddings_path=lehome_t5_embeddings_path,
+    stats_path=lehome_chunk30_stats_path,
+    chunk_size=LEHOME_DUAL_ENDPOINT_ACTION_CHUNK_SIZE,
+    use_image_aug=True,
+    use_stronger_image_aug=True,
+    normalize_proprio=True,
+    normalize_actions=True,
+    num_duplicates_per_image=4,
+    demonstration_sampling_prob=0.75,
+    proprio_conditioning_dropout_prob=0.5,
+    predict_midpoint_images=True,
+    use_wrist_images=False,
+    use_third_person_images=True,
+    use_proprio=True,
+    return_value_function_returns=False,
+)
+lehome_dual_endpoint_chunk30_validation_dataset = L(LeHomeDataset)(
+    data_dir=lehome_data_dir,
+    split="validation",
+    t5_text_embeddings_path=lehome_t5_embeddings_path,
+    stats_path=lehome_chunk30_stats_path,
+    chunk_size=LEHOME_DUAL_ENDPOINT_ACTION_CHUNK_SIZE,
+    use_image_aug=False,
+    use_stronger_image_aug=False,
+    normalize_proprio=True,
+    normalize_actions=True,
+    num_duplicates_per_image=4,
+    demonstration_sampling_prob=0.75,
+    proprio_conditioning_dropout_prob=0.0,
+    predict_midpoint_images=True,
+)
+
+cosmos_predict2_2b_480p_lehome_100_demos_dual_endpoint_jointloss_dropout50_chunk30 = LazyDict(
+    dict(
+        defaults=[
+            "/experiment/cosmos_predict2_2b_480p_lehome_100_demos_endpoint_jointloss_dropout50_chunk30_prod_v3",
+            "_self_",
+        ],
+        model=L(CosmosPolicyVideo2WorldModel)(
+            config=dict(
+                state_t=LEHOME_DUAL_ENDPOINT_STATE_T,
+                min_num_conditional_frames=LEHOME_DUAL_ENDPOINT_NUM_CONDITIONAL_LATENTS,
+                max_num_conditional_frames=LEHOME_DUAL_ENDPOINT_NUM_CONDITIONAL_LATENTS,
+                tokenizer=dict(
+                    chunk_duration=LEHOME_DUAL_ENDPOINT_RAW_SEQUENCE_FRAMES,
+                ),
+            ),
+        ),
+        dataloader_train=L(DataLoader)(
+            num_workers=12,
+            persistent_workers=True,
+            pin_memory=True,
+            dataset=lehome_dual_endpoint_chunk30_train_dataset,
+            sampler=L(DistributedSampler)(
+                dataset=lehome_dual_endpoint_chunk30_train_dataset,
+                num_replicas=L(parallel_state.get_data_parallel_world_size)(),
+                rank=L(parallel_state.get_data_parallel_rank)(),
+                shuffle=True,
+                seed=0,
+            ),
+            batch_size=6,
+            drop_last=True,
+        ),
+        dataloader_val=L(DataLoader)(
+            num_workers=4,
+            persistent_workers=True,
+            pin_memory=True,
+            dataset=lehome_dual_endpoint_chunk30_validation_dataset,
+            sampler=L(DistributedSampler)(
+                dataset=lehome_dual_endpoint_chunk30_validation_dataset,
+                num_replicas=L(parallel_state.get_data_parallel_world_size)(),
+                rank=L(parallel_state.get_data_parallel_rank)(),
+                shuffle=False,
+                seed=0,
+            ),
+            batch_size=6,
+            drop_last=False,
+        ),
+        job=dict(
+            name="cosmos_predict2_2b_480p_lehome_100_demos_dual_endpoint_jointloss_dropout50_chunk30_prod_v1",
+        ),
+    )
+)
+
+cosmos_predict2_2b_480p_lehome_100_demos_dual_endpoint_jointloss_dropout50_chunk30_inference = LazyDict(
+    dict(
+        defaults=[
+            "/experiment/cosmos_predict2_2b_480p_lehome_100_demos_dual_endpoint_jointloss_dropout50_chunk30_prod_v1",
+            "_self_",
+        ],
+        model=L(CosmosPolicyVideo2WorldModel)(
+            config=dict(sde=L(HybridEDMSDE)(sigma_max=80, sigma_min=4)),
+        ),
+        job=dict(
+            group="cosmos_v2_inference",
+            name="cosmos_predict2_2b_480p_lehome_100_demos_dual_endpoint_jointloss_dropout50_chunk30_prod_v1_inference",
+        ),
+    )
+)
+
+cosmos_predict2_2b_480p_lehome_100_demos_endpoint_jointloss_dropout50_inference = LazyDict(
+    dict(
+        defaults=[
+            "/experiment/cosmos_predict2_2b_480p_lehome_100_demos_endpoint_jointloss_dropout50_prod_v2",
+            "_self_",
+        ],
+        model=L(CosmosPolicyVideo2WorldModel)(
+            config=dict(
+                sde=L(HybridEDMSDE)(sigma_max=80, sigma_min=4),
+            ),
+        ),
+        job=dict(
+            group="cosmos_v2_inference",
+            name="cosmos_predict2_2b_480p_lehome_100_demos_endpoint_jointloss_dropout50_prod_v2_inference",
+        ),
+    )
+)
+
+
+# Corrected LeHome world-action model. Unlike the legacy experiment above,
+# this model predicts every one of the 60 future top-camera frames, followed
+# by a separate q0-anchored 60x12 action latent. Keep a distinct job name so a
+# legacy endpoint-only checkpoint can never be resumed into this layout.
+lehome_dense_video_train_dataset = L(LeHomeDataset)(
+    data_dir=lehome_data_dir,
+    split="train",
+    t5_text_embeddings_path=lehome_t5_embeddings_path,
+    stats_path=lehome_stats_path,
+    chunk_size=LEHOME_ACTION_CHUNK_SIZE,
+    use_image_aug=True,
+    use_stronger_image_aug=True,
+    normalize_proprio=True,
+    normalize_actions=True,
+    num_duplicates_per_image=4,
+    demonstration_sampling_prob=0.75,
+    proprio_conditioning_dropout_prob=0.5,
+    predict_dense_video=True,
+    use_wrist_images=False,
+    use_third_person_images=True,
+    use_proprio=True,
+    return_value_function_returns=False,
+)
+lehome_dense_video_validation_dataset = L(LeHomeDataset)(
+    data_dir=lehome_data_dir,
+    split="validation",
+    t5_text_embeddings_path=lehome_t5_embeddings_path,
+    stats_path=lehome_stats_path,
+    chunk_size=LEHOME_ACTION_CHUNK_SIZE,
+    use_image_aug=False,
+    use_stronger_image_aug=False,
+    normalize_proprio=True,
+    normalize_actions=True,
+    num_duplicates_per_image=4,
+    demonstration_sampling_prob=0.75,
+    proprio_conditioning_dropout_prob=0.0,
+    predict_dense_video=True,
+)
+
+cosmos_predict2_2b_480p_lehome_100_demos_dense_video_dropout50 = LazyDict(
+    dict(
+        defaults=[
+            "/experiment/cosmos_predict2_2b_480p_lehome_100_demos_no_value",
+            "_self_",
+        ],
+        trainer=dict(
+            callbacks=dict(
+                # The 81-frame causal VAE repeatedly recompiles under
+                # torch.compile on A100, pinning all GPUs for minutes. Eager
+                # encoding is stable and already runs at normal throughput.
+                compile_tokenizer=dict(enabled=False),
+                # W&B 0.23.1 rejects the DeviceMonitor table artifact and then
+                # queues subsequent scalar history behind it. Keep scalar GPU
+                # telemetry, but do not emit the optional table artifact.
+                device_monitor=dict(log_wandb_table=False),
+                # Both loss loggers inspect CUDA tensors every step. Keep all
+                # ranks out of the next FSDP forward until each logger is done.
+                wandb=dict(synchronize_ranks_after_step=True),
+                wandb_10x=dict(synchronize_ranks_after_step=True),
+                every_n_sample_reg=dict(
+                    every_n=5000,
+                    save_s3=False,
+                    use_negative_prompt=False,
+                    guidance=[0],
+                    num_sampling_step=9,
+                    fps=LEHOME_VIDEO_FPS,
+                ),
+            ),
+            run_validation=True,
+            run_validation_on_start=False,
+            validation_iter=5000,
+            max_val_iter=None,
+            max_iter=50000,
+            # A microbatch of 12 exceeds a 40 GB A100 during the DiT MLP, and
+            # 6 leaves insufficient headroom for a distributed checkpoint.
+            # 4 samples x 3 accumulation steps x 8 GPUs preserves the
+            # intended effective global batch of 96.
+            grad_accum_iter=3,
+        ),
+        model=L(CosmosPolicyVideo2WorldModel)(
+            config=dict(
+                state_t=LEHOME_STATE_T,
+                min_num_conditional_frames=LEHOME_NUM_CONDITIONAL_LATENTS,
+                max_num_conditional_frames=LEHOME_NUM_CONDITIONAL_LATENTS,
+                # Fifteen video latents versus one action latent: this keeps
+                # the action objective comparable to the full-video objective.
+                action_loss_multiplier=15,
+                # The 75% demo / 25% world-model sampler below now means
+                # action-only versus full-future-video-only optimization.
+                mask_loss_for_action_future_state_prediction=True,
+                tokenizer=dict(
+                    chunk_duration=LEHOME_RAW_SEQUENCE_FRAMES,
+                ),
+            ),
+        ),
+        dataloader_train=L(DataLoader)(
+            num_workers=12,
+            persistent_workers=True,
+            pin_memory=True,
+            dataset=lehome_dense_video_train_dataset,
+            sampler=L(DistributedSampler)(
+                dataset=lehome_dense_video_train_dataset,
+                num_replicas=L(parallel_state.get_data_parallel_world_size)(),
+                rank=L(parallel_state.get_data_parallel_rank)(),
+                shuffle=True,
+                seed=0,
+            ),
+            batch_size=4,
+            drop_last=True,
+        ),
+        dataloader_val=L(DataLoader)(
+            num_workers=4,
+            persistent_workers=True,
+            pin_memory=True,
+            dataset=lehome_dense_video_validation_dataset,
+            sampler=L(DistributedSampler)(
+                dataset=lehome_dense_video_validation_dataset,
+                num_replicas=L(parallel_state.get_data_parallel_world_size)(),
+                rank=L(parallel_state.get_data_parallel_rank)(),
+                shuffle=False,
+                seed=0,
+            ),
+            batch_size=4,
+            drop_last=False,
+        ),
+        job=dict(
+            project="cosmos2b-wam-lehome",
+            wandb_mode="online",
+            group="cosmos_v2_finetune",
+            name="cosmos_predict2_2b_480p_lehome_100_demos_dense_video_dropout50_prod_v3",
         ),
     )
 )
@@ -594,6 +1087,14 @@ def register_configs():
         cosmos_predict2_2b_480p_robocasa_50_demos_per_task__inference,
         # LeHome
         cosmos_predict2_2b_480p_lehome_100_demos_no_value,
+        cosmos_predict2_2b_480p_lehome_100_demos_endpoint_dropout50,
+        cosmos_predict2_2b_480p_lehome_100_demos_endpoint_jointloss_dropout50,
+        cosmos_predict2_2b_480p_lehome_100_demos_endpoint_jointloss_dropout50_chunk30,
+        cosmos_predict2_2b_480p_lehome_100_demos_endpoint_jointloss_dropout50_chunk30_inference,
+        cosmos_predict2_2b_480p_lehome_100_demos_dual_endpoint_jointloss_dropout50_chunk30,
+        cosmos_predict2_2b_480p_lehome_100_demos_dual_endpoint_jointloss_dropout50_chunk30_inference,
+        cosmos_predict2_2b_480p_lehome_100_demos_endpoint_jointloss_dropout50_inference,
+        cosmos_predict2_2b_480p_lehome_100_demos_dense_video_dropout50,
         # ALOHA
         cosmos_predict2_2b_480p_aloha_185_demos_4_tasks_mixture_foldshirt15_candiesinbowl45_candyinbag45_eggplantchickenonplate80,  # *** Main checkpoint ***
         cosmos_predict2_2b_480p_aloha_185_demos_4_tasks_mixture_foldshirt15_candiesinbowl45_candyinbag45_eggplantchickenonplate80__inference_only,

@@ -7,10 +7,12 @@ output_dir="${COSMOS_OUTPUT_DIR:-${HOME}/cosmos-policy-output}"
 cache_dir="${COSMOS_CACHE_DIR:-${HOME}/.cache/cosmos}"
 hf_cache_dir="${HF_HOME:-${HOME}/.cache/huggingface}"
 master_port="${MASTER_PORT:-12341}"
+experiment="${COSMOS_EXPERIMENT:-cosmos_predict2_2b_480p_lehome_100_demos_endpoint_jointloss_dropout50_prod_v2}"
+embeddings_path="${LEHOME_T5_EMBEDDINGS_PATH:-${repo_dir}/../t5_embeddings.pkl}"
 
 required_paths=(
     "${repo_dir}/datasets/lehome"
-    "${repo_dir}/datasets/lehome/t5_embeddings.pkl"
+    "${embeddings_path}"
     "${repo_dir}/cosmos-policy/.venv/pyvenv.cfg"
     "${HOME}/.aws"
     "${HOME}/.netrc"
@@ -22,7 +24,8 @@ for path in "${required_paths[@]}"; do
     fi
 done
 
-mkdir -p "${output_dir}" "${cache_dir}" "${hf_cache_dir}"
+mkdir -p "${output_dir}" "${output_dir}/wandb" "${cache_dir}" "${hf_cache_dir}"
+embeddings_path="$(realpath "${embeddings_path}")"
 
 docker_cmd=(docker)
 if ! docker info >/dev/null 2>&1; then
@@ -41,11 +44,14 @@ exec "${docker_cmd[@]}" run --rm \
     -e BASE_DATASETS_DIR=/workspace/datasets \
     -e IMAGINAIRE_OUTPUT_ROOT=/outputs \
     -e WANDB_DIR=/outputs/wandb \
+    -e LEHOME_T5_EMBEDDINGS_PATH=/runtime/t5_embeddings.pkl \
+    -e COSMOS_POLICY_CHECKPOINT_OVERRIDE="${COSMOS_POLICY_CHECKPOINT_OVERRIDE:-}" \
     -e TORCH_NCCL_ASYNC_ERROR_HANDLING=1 \
     -v "${repo_dir}:/workspace" \
     -v "${output_dir}:/outputs" \
     -v "${cache_dir}:/home/ubuntu/.cache" \
     -v "${hf_cache_dir}:/home/ubuntu/.cache/huggingface" \
+    -v "${embeddings_path}:/runtime/t5_embeddings.pkl:ro" \
     -v "${HOME}/.aws:/home/ubuntu/.aws:ro" \
     -v "${HOME}/.netrc:/home/ubuntu/.netrc:ro" \
     -w /workspace/cosmos-policy \
@@ -53,6 +59,5 @@ exec "${docker_cmd[@]}" run --rm \
     .venv/bin/torchrun --nproc_per_node=8 --master_port="${master_port}" \
     -m cosmos_policy.scripts.train \
     --config=cosmos_policy/config/config.py -- \
-    experiment=cosmos_predict2_2b_480p_lehome_100_demos_no_value \
-    job.name=cosmos_predict2_2b_480p_lehome_100_demos_no_value_proprio_dropout50 \
+    "experiment=${experiment}" \
     "$@"

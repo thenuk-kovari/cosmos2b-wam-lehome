@@ -82,8 +82,18 @@ def load_model_from_checkpoint(
     """
     if experiment_opts is None:
         experiment_opts = []
-    config_module = get_config_module(config_file)
-    config = importlib.import_module(config_module).make_config()
+    checkpoint_override_key = "COSMOS_POLICY_CHECKPOINT_OVERRIDE"
+    previous_checkpoint_override = os.environ.get(checkpoint_override_key)
+    if s3_checkpoint_dir:
+        os.environ[checkpoint_override_key] = str(s3_checkpoint_dir)
+    try:
+        config_module = get_config_module(config_file)
+        config = importlib.import_module(config_module).make_config()
+    finally:
+        if previous_checkpoint_override is None:
+            os.environ.pop(checkpoint_override_key, None)
+        else:
+            os.environ[checkpoint_override_key] = previous_checkpoint_override
     config = override(config, ["--", f"experiment={experiment_name}"] + experiment_opts)
 
     # Override checkpoint path if provided
@@ -215,7 +225,7 @@ def load_model_state_dict_from_checkpoint(
 
     from cosmos_policy._src.imaginaire.utils.checkpoint_db import get_checkpoint_path
 
-    load_from_local = True
+    load_from_local = checkpoint_format == "pt"
     local_s3_ckpt_fp = get_checkpoint_path(cur_key_ckpt_full_path)
 
     if SMOKE:

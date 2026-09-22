@@ -49,10 +49,10 @@ except ImportError:
 
 from torchvision import transforms
 
-if Version(te.__version__) >= Version("2.8.0"):
-    from transformer_engine.pytorch.attention.rope import apply_rotary_pos_emb
-else:
+try:
     from transformer_engine.pytorch.attention import apply_rotary_pos_emb
+except ImportError:
+    from transformer_engine.pytorch.attention.rope import apply_rotary_pos_emb
 from torch.nn.attention.flex_attention import BlockMask, create_block_mask, flex_attention
 
 from cosmos_policy._src.imaginaire.attention import attention

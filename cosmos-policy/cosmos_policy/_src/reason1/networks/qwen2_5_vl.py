@@ -65,8 +65,6 @@ else:
     print("flash_attn_2 not available")
     flash_attn_varlen_func = None
 
-assert is_flash_attn_2_available(), "flash_attn_2 not available. run pip install flash_attn"
-
 logger = logging.get_logger(__name__)
 
 _CONFIG_FOR_DOC = "Qwen2_5_VLConfig"

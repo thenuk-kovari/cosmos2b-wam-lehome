@@ -40,6 +40,27 @@ from cosmos_policy._src.predict2.inference.get_t5_emb import get_text_embedding
 from cosmos_policy._src.predict2.utils.model_loader import load_model_from_checkpoint
 from cosmos_policy.constants import ACTION_DIM
 from cosmos_policy.datasets.dataset_utils import apply_jpeg_compression_np, resize_images
+from cosmos_policy.lehome_dual_endpoint_layout import (
+    ACTION_LATENT_IDX as LEHOME_DUAL_ENDPOINT_ACTION_LATENT_IDX,
+    ENDPOINT_HEAD_LATENT_IDX as LEHOME_DUAL_ENDPOINT_HEAD_LATENT_IDX,
+    ENDPOINT_LEFT_LATENT_IDX as LEHOME_DUAL_ENDPOINT_LEFT_LATENT_IDX,
+    ENDPOINT_RIGHT_LATENT_IDX as LEHOME_DUAL_ENDPOINT_RIGHT_LATENT_IDX,
+    FUTURE_IMAGE_END_LATENT_IDX as LEHOME_DUAL_ENDPOINT_IMAGE_END_LATENT_IDX,
+    FUTURE_IMAGE_START_LATENT_IDX as LEHOME_DUAL_ENDPOINT_IMAGE_START_LATENT_IDX,
+    FUTURE_PROPRIO_LATENT_IDX as LEHOME_DUAL_ENDPOINT_FUTURE_PROPRIO_LATENT_IDX,
+    MIDPOINT_HEAD_LATENT_IDX as LEHOME_MIDPOINT_HEAD_LATENT_IDX,
+    MIDPOINT_LEFT_LATENT_IDX as LEHOME_MIDPOINT_LEFT_LATENT_IDX,
+    MIDPOINT_RIGHT_LATENT_IDX as LEHOME_MIDPOINT_RIGHT_LATENT_IDX,
+    validate_dual_endpoint_layout_parameters,
+)
+from cosmos_policy.lehome_layout import (
+    ACTION_CHUNK_SIZE as LEHOME_ACTION_CHUNK_SIZE,
+    FUTURE_VIDEO_END_LATENT_IDX as LEHOME_FUTURE_VIDEO_END_LATENT_IDX,
+    FUTURE_VIDEO_LATENT_FRAMES as LEHOME_FUTURE_VIDEO_LATENT_FRAMES,
+    FUTURE_VIDEO_START_LATENT_IDX as LEHOME_FUTURE_VIDEO_START_LATENT_IDX,
+    VIDEO_FPS as LEHOME_VIDEO_FPS,
+    validate_dense_layout_parameters,
+)
 from cosmos_policy.utils.utils import duplicate_array
 
 # Initialize important constants
@@ -87,6 +108,17 @@ def get_latent_indices_from_model_config(model):
             Sequence: [blank, curr_proprio, curr_wrist_img1, curr_wrist_img2, curr_third_person_img, action,
                       future_proprio, future_wrist1, future_wrist2, future_third_person_img, value]
             Returns: (1, 4, 6, 9)
+
+        LeHome dense video (state_t=21, min_conditional_frames=5):
+            Sequence: [blank, current proprio/left/right/top, 15 future-video
+                      latents, action]
+            Returns: (1, 4, 5, 19)
+
+        LeHome dual endpoint (state_t=13, min_conditional_frames=5):
+            Sequence: [blank, current proprio/left/right/top, action,
+                      endpoint proprio, midpoint left/right/top,
+                      endpoint left/right/top]
+            Returns: (1, 4, 6, 12)
     """
     state_t = model.config.state_t
     min_conditional_frames = model.config.min_num_conditional_frames
@@ -97,6 +129,12 @@ def get_latent_indices_from_model_config(model):
     elif state_t == 11 and min_conditional_frames == 5:
         # RoboCasa/ALOHA setup
         return (1, 4, 6, 9)
+    elif state_t == 13 and min_conditional_frames == 5:
+        # LeHome t+15/t+30 three-camera endpoint setup
+        return (1, 4, 6, 12)
+    elif state_t == 21 and min_conditional_frames == 5:
+        # LeHome dense 60-frame future-video setup
+        return (1, 4, 5, 19)
     else:
         raise ValueError(
             f"Unknown model config! state_t={state_t}, min_num_conditional_frames={min_conditional_frames}."
@@ -217,6 +255,9 @@ def resolve_path(path: str, cache_dir: str | None = None) -> str:
         str: Resolved local path
     """
     if path is None or path == "":
+        return path
+
+    if os.path.exists(path):
         return path
 
     # Check if it's an HF file path (org/repo/filename with 3+ parts)
@@ -661,20 +702,22 @@ def rescale_proprio(proprio, dataset_stats, non_negative_only=False, scale_multi
     Returns:
         np.ndarray: Rescaled proprio
     """
-    arr = proprio
+    arr = np.asarray(proprio)
     curr_min = dataset_stats["proprio_min"]
     curr_max = dataset_stats["proprio_max"]
+    span = curr_max - curr_min
+    safe_span = np.where(span > 1e-8, span, 1.0)
     # First, scale to [-1,+1] or [0,+1]:
     # - For [-1,+1]: x_new = 2 * ((x - curr_min) / (curr_max - curr_min)) - 1
     # - For [0,+1]: x_new = (x - curr_min) / (curr_max - curr_min)
     if not non_negative_only:  # [-1,+1]
-        rescaled_arr = 2 * ((arr - curr_min) / (curr_max - curr_min)) - 1
+        rescaled_arr = 2 * ((arr - curr_min) / safe_span) - 1
     else:  # [0,+1]
-        rescaled_arr = (arr - curr_min) / (curr_max - curr_min)
+        rescaled_arr = (arr - curr_min) / safe_span
+    rescaled_arr[..., span <= 1e-8] = 0.0
     # Scale to [-scale_multiplier,+scale_multiplier] or [0,+scale_multiplier]
     rescaled_arr = scale_multiplier * rescaled_arr
-    proprio = rescaled_arr
-    return proprio
+    return rescaled_arr
 
 
 def undo_latent_injection(
@@ -714,6 +757,9 @@ def get_future_images_from_generated_samples(
     future_image_latent_idx: int = None,
     future_image2_latent_idx: int = None,
     temporal_compression_factor: int = 4,
+    midpoint_wrist_image_latent_idx: int = None,
+    midpoint_wrist_image2_latent_idx: int = None,
+    midpoint_image_latent_idx: int = None,
 ) -> Dict[str, Any]:
     """
     Get predicted future images from generated samples.
@@ -729,6 +775,9 @@ def get_future_images_from_generated_samples(
         future_image_latent_idx (int): Index of future primary image in video
         future_image2_latent_idx (int): Index of future secondary image in video
         temporal_compression_factor (int): Temporal compression factor for VAE
+        midpoint_wrist_image_latent_idx (int): Optional t+15 left-camera index
+        midpoint_wrist_image2_latent_idx (int): Optional t+15 right-camera index
+        midpoint_image_latent_idx (int): Optional t+15 primary-camera index
 
     Returns:
         Dict[str, Any]: Dictionary containing future image predictions
@@ -760,6 +809,24 @@ def get_future_images_from_generated_samples(
         if cfg.num_third_person_images == 2:
             future_image2 = generated_images[:, future_image2_raw_idx]
             future_image_predictions["future_image2"] = future_image2
+
+    midpoint_indices = (
+        midpoint_wrist_image_latent_idx,
+        midpoint_wrist_image2_latent_idx,
+        midpoint_image_latent_idx,
+    )
+    if all(index is not None and index >= 0 for index in midpoint_indices):
+        midpoint_raw_indices = [
+            (index - 1) * temporal_compression_factor + 1
+            for index in midpoint_indices
+        ]
+        future_image_predictions.update(
+            {
+                "midpoint_wrist_image": generated_images[:, midpoint_raw_indices[0]],
+                "midpoint_wrist_image2": generated_images[:, midpoint_raw_indices[1]],
+                "midpoint_image": generated_images[:, midpoint_raw_indices[2]],
+            }
+        )
     return future_image_predictions
 
 
@@ -913,7 +980,7 @@ def get_action(
             WRIST_IMAGE_IDX = 0
             IMAGE_IDX = 1
             IMAGE2_IDX = 2
-        elif cfg.suite == "aloha":
+        elif cfg.suite in {"aloha", "lehome"}:
             all_camera_images = [
                 obs["left_wrist_image"],
                 obs["right_wrist_image"],
@@ -991,47 +1058,174 @@ def get_action(
                 current_image2_latent_idx = current_sequence_idx
                 current_sequence_idx += 1
 
-        # Add blank placeholder images for action chunk (action chunk will be injected into latent later)
-        image_sequence.append(blank_image_duplicated.copy())
-        action_latent_idx = current_sequence_idx
-        current_sequence_idx += 1
+        future_video_start_latent_idx = -1
+        future_video_end_latent_idx = -1
+        future_proprio_latent_idx = -1
+        future_wrist_image_latent_idx = -1
+        future_wrist_image2_latent_idx = -1
+        future_image_latent_idx = -1
+        future_image2_latent_idx = -1
+        midpoint_wrist_image_latent_idx = -1
+        midpoint_wrist_image2_latent_idx = -1
+        midpoint_image_latent_idx = -1
 
-        # Add blank placeholder images for future proprioceptive state (future proprio will be injected into latent later)
-        if cfg.use_proprio:
+        dense_lehome_video = cfg.suite == "lehome" and getattr(
+            cfg, "predict_dense_video", False
+        )
+        dual_endpoint_lehome = cfg.suite == "lehome" and getattr(
+            cfg, "predict_midpoint_images", False
+        )
+        if dense_lehome_video and dual_endpoint_lehome:
+            raise ValueError(
+                "predict_dense_video and predict_midpoint_images are mutually exclusive"
+            )
+        if dense_lehome_video:
+            validate_dense_layout_parameters(
+                cfg.chunk_size, COSMOS_TEMPORAL_COMPRESSION_FACTOR
+            )
+            if current_sequence_idx != LEHOME_FUTURE_VIDEO_START_LATENT_IDX:
+                raise ValueError(
+                    "LeHome dense-video conditioning layout drifted: "
+                    f"future video starts at latent {current_sequence_idx}, expected "
+                    f"{LEHOME_FUTURE_VIDEO_START_LATENT_IDX}"
+                )
+
+            # These 60 current-frame copies are only VAE placeholders. Slots
+            # 5..19 are unconditioned and diffusion generates their full video.
+            image_sequence.append(
+                duplicate_array(primary_image, total_num_copies=LEHOME_ACTION_CHUNK_SIZE)
+            )
+            future_video_start_latent_idx = current_sequence_idx
+            current_sequence_idx += LEHOME_FUTURE_VIDEO_LATENT_FRAMES
+            future_video_end_latent_idx = current_sequence_idx - 1
+            future_image_latent_idx = future_video_end_latent_idx
+            if future_video_end_latent_idx != LEHOME_FUTURE_VIDEO_END_LATENT_IDX:
+                raise AssertionError("LeHome future-video latent range is inconsistent")
+
+            # The entire 60x12 action chunk is injected into its own terminal
+            # latent. It must not interrupt the contiguous video token range.
+            image_sequence.append(blank_image_duplicated.copy())
+            action_latent_idx = current_sequence_idx
+            current_sequence_idx += 1
+        elif dual_endpoint_lehome:
+            validate_dual_endpoint_layout_parameters(
+                cfg.chunk_size, COSMOS_TEMPORAL_COMPRESSION_FACTOR
+            )
+            if current_sequence_idx != LEHOME_DUAL_ENDPOINT_ACTION_LATENT_IDX:
+                raise ValueError(
+                    "LeHome dual-endpoint conditioning layout drifted: "
+                    f"action latent is {current_sequence_idx}, expected "
+                    f"{LEHOME_DUAL_ENDPOINT_ACTION_LATENT_IDX}"
+                )
+
+            image_sequence.append(blank_image_duplicated.copy())
+            action_latent_idx = current_sequence_idx
+            current_sequence_idx += 1
+
             image_sequence.append(blank_image_duplicated.copy())
             future_proprio_latent_idx = current_sequence_idx
             current_sequence_idx += 1
-        # Add placeholders for the future wrist image(s) - copies of the current wrist image(s)
-        if cfg.use_wrist_image:
+            if (
+                future_proprio_latent_idx
+                != LEHOME_DUAL_ENDPOINT_FUTURE_PROPRIO_LATENT_IDX
+            ):
+                raise AssertionError("LeHome dual-endpoint proprio index drifted")
+
+            image_sequence.append(wrist_image_duplicated.copy())
+            midpoint_wrist_image_latent_idx = current_sequence_idx
+            current_sequence_idx += 1
+            image_sequence.append(wrist_image2_duplicated.copy())
+            midpoint_wrist_image2_latent_idx = current_sequence_idx
+            current_sequence_idx += 1
+            image_sequence.append(primary_image_duplicated.copy())
+            midpoint_image_latent_idx = current_sequence_idx
+            current_sequence_idx += 1
+
             image_sequence.append(wrist_image_duplicated.copy())
             future_wrist_image_latent_idx = current_sequence_idx
             current_sequence_idx += 1
-            if cfg.num_wrist_images == 2:
-                image_sequence.append(wrist_image2_duplicated.copy())
-                future_wrist_image2_latent_idx = current_sequence_idx
-                current_sequence_idx += 1
-            else:
-                future_wrist_image2_latent_idx = -1
-        # Add placeholders for the future primary/secondary images - copies of the current primary/secondary images
-        if cfg.use_third_person_image:
+            image_sequence.append(wrist_image2_duplicated.copy())
+            future_wrist_image2_latent_idx = current_sequence_idx
+            current_sequence_idx += 1
             image_sequence.append(primary_image_duplicated.copy())
             future_image_latent_idx = current_sequence_idx
             current_sequence_idx += 1
-            if cfg.num_third_person_images == 2:
-                image_sequence.append(secondary_image_duplicated.copy())
-                future_image2_latent_idx = current_sequence_idx
-                current_sequence_idx += 1
-            else:
-                future_image2_latent_idx = -1
 
-        # Add placeholder for the value (value will be injected into latent later)
-        image_sequence.append(blank_image_duplicated.copy())
-        value_latent_idx = current_sequence_idx
-        current_sequence_idx += 1
+            actual_indices = (
+                midpoint_wrist_image_latent_idx,
+                midpoint_wrist_image2_latent_idx,
+                midpoint_image_latent_idx,
+                future_wrist_image_latent_idx,
+                future_wrist_image2_latent_idx,
+                future_image_latent_idx,
+            )
+            expected_indices = (
+                LEHOME_MIDPOINT_LEFT_LATENT_IDX,
+                LEHOME_MIDPOINT_RIGHT_LATENT_IDX,
+                LEHOME_MIDPOINT_HEAD_LATENT_IDX,
+                LEHOME_DUAL_ENDPOINT_LEFT_LATENT_IDX,
+                LEHOME_DUAL_ENDPOINT_RIGHT_LATENT_IDX,
+                LEHOME_DUAL_ENDPOINT_HEAD_LATENT_IDX,
+            )
+            if actual_indices != expected_indices:
+                raise AssertionError(
+                    f"LeHome dual-endpoint camera indices {actual_indices} "
+                    f"do not match {expected_indices}"
+                )
+            future_video_start_latent_idx = LEHOME_DUAL_ENDPOINT_IMAGE_START_LATENT_IDX
+            future_video_end_latent_idx = LEHOME_DUAL_ENDPOINT_IMAGE_END_LATENT_IDX
+        else:
+            # Legacy endpoint-state layout used by the upstream robot suites.
+            image_sequence.append(blank_image_duplicated.copy())
+            action_latent_idx = current_sequence_idx
+            current_sequence_idx += 1
+
+            if cfg.use_proprio:
+                image_sequence.append(blank_image_duplicated.copy())
+                future_proprio_latent_idx = current_sequence_idx
+                current_sequence_idx += 1
+            if cfg.use_wrist_image:
+                image_sequence.append(wrist_image_duplicated.copy())
+                future_wrist_image_latent_idx = current_sequence_idx
+                current_sequence_idx += 1
+                if cfg.num_wrist_images == 2:
+                    image_sequence.append(wrist_image2_duplicated.copy())
+                    future_wrist_image2_latent_idx = current_sequence_idx
+                    current_sequence_idx += 1
+            if cfg.use_third_person_image:
+                image_sequence.append(primary_image_duplicated.copy())
+                future_image_latent_idx = current_sequence_idx
+                current_sequence_idx += 1
+                if cfg.num_third_person_images == 2:
+                    image_sequence.append(secondary_image_duplicated.copy())
+                    future_image2_latent_idx = current_sequence_idx
+                    current_sequence_idx += 1
+
+        # LeHome was trained without a value target and therefore has no value
+        # latent. Other suites retain the original value placeholder.
+        use_value_prediction = getattr(cfg, "use_value_prediction", True)
+        if use_value_prediction:
+            image_sequence.append(blank_image_duplicated.copy())
+            value_latent_idx = current_sequence_idx
+            current_sequence_idx += 1
+        else:
+            value_latent_idx = -1
+
+        if current_sequence_idx != model.config.state_t:
+            raise ValueError(
+                "Inference sequence/model mismatch: constructed "
+                f"{current_sequence_idx} latent frames, model expects {model.config.state_t}"
+            )
 
         # Prepare input data batch, which is needed for sampling
         # We follow the logic in cosmos_policy._src.predict2.inference.video2world.py > _get_data_batch_input
         raw_image_sequence = np.concatenate(image_sequence, axis=0)
+        expected_raw_frames = model.tokenizer.get_pixel_num_frames(model.config.state_t)
+        if raw_image_sequence.shape[0] != expected_raw_frames:
+            raise ValueError(
+                "Inference raw-video/model mismatch: constructed "
+                f"{raw_image_sequence.shape[0]} frames, tokenizer expects {expected_raw_frames}"
+            )
         raw_image_sequence = np.expand_dims(raw_image_sequence, axis=0)  # (T, H, W, C) -> (1, T, H, W, C)
         raw_image_sequence = np.tile(raw_image_sequence, (batch_size, 1, 1, 1, 1))  # (1, T, H, W, C) -> (B, T, H, W, C)
         raw_image_sequence = np.transpose(raw_image_sequence, (0, 4, 1, 2, 3))  # (B, T, H, W, C) -> (B, C, T, H, W)
@@ -1046,8 +1240,9 @@ def get_action(
             "video": raw_image_sequence,  # (B, C, T, H, W)
             "t5_text_embeddings": text_embedding.repeat(batch_size, 1, 1).to(dtype=torch.bfloat16).cuda(),
             "fps": torch.tensor(
-                [16] * batch_size, dtype=torch.bfloat16
-            ).cuda(),  # Just match the training config (always 16 FPS)
+                [LEHOME_VIDEO_FPS if (dense_lehome_video or dual_endpoint_lehome) else 16] * batch_size,
+                dtype=torch.bfloat16,
+            ).cuda(),
             "padding_mask": torch.zeros(
                 (batch_size, 1, COSMOS_IMAGE_SIZE, COSMOS_IMAGE_SIZE), dtype=torch.bfloat16
             ).cuda(),  # Padding mask (assume no padding here)
@@ -1105,6 +1300,18 @@ def get_action(
                 if cfg.use_third_person_image and cfg.num_third_person_images == 2
                 else torch.tensor([-1] * batch_size, dtype=torch.int64).cuda()
             ),
+            "midpoint_wrist_image_latent_idx": torch.tensor(
+                [midpoint_wrist_image_latent_idx] * batch_size,
+                dtype=torch.int64,
+            ).cuda(),
+            "midpoint_wrist_image2_latent_idx": torch.tensor(
+                [midpoint_wrist_image2_latent_idx] * batch_size,
+                dtype=torch.int64,
+            ).cuda(),
+            "midpoint_image_latent_idx": torch.tensor(
+                [midpoint_image_latent_idx] * batch_size,
+                dtype=torch.int64,
+            ).cuda(),
             "value_latent_idx": torch.tensor([value_latent_idx] * batch_size, dtype=torch.int64).cuda(),
         }
 
@@ -1124,9 +1331,12 @@ def get_action(
         action_indices = torch.full(
             (batch_size,), action_latent_idx, dtype=torch.int64, device=generated_latent_with_action.device
         )
+        action_dim = getattr(cfg, "action_dim", ACTION_DIM)
         actions = (
             extract_action_chunk_from_latent_sequence(
-                generated_latent_with_action, action_shape=(cfg.chunk_size, ACTION_DIM), action_indices=action_indices
+                generated_latent_with_action,
+                action_shape=(cfg.chunk_size, action_dim),
+                action_indices=action_indices,
             )
             .to(torch.float32)
             .cpu()
@@ -1155,7 +1365,7 @@ def get_action(
                     5,
                     6,
                 ]  # 0: blank, 1: curr proprio, 2: curr wrist img, 3: curr primary img, 4: curr secondary img, 5: action, 6: future proprio, 7: future wrist img, 8: future primary img, 9: future secondary img, 10: value
-            elif cfg.suite == "aloha":
+            elif cfg.suite in {"aloha", "lehome"}:
                 INDICES_TO_REPLACE = [
                     0,
                     1,
@@ -1175,13 +1385,22 @@ def get_action(
                 future_image_latent_idx if cfg.use_third_person_image else -1,
                 future_image2_latent_idx if cfg.use_third_person_image and cfg.num_third_person_images == 2 else -1,
                 temporal_compression_factor=COSMOS_TEMPORAL_COMPRESSION_FACTOR,
+                midpoint_wrist_image_latent_idx=midpoint_wrist_image_latent_idx,
+                midpoint_wrist_image2_latent_idx=midpoint_wrist_image2_latent_idx,
+                midpoint_image_latent_idx=midpoint_image_latent_idx,
             )
-            # Get value predictions from the generated sample
-            value_indices = torch.full((batch_size,), -1, dtype=torch.int64, device=generated_latent_with_action.device)
-            value_prediction = extract_value_from_latent_sequence(generated_latent_with_action, value_indices)
-            # Unnormalize value predictions from [-1, +1] to [0, 1], and clip to [0, 1]
-            value_prediction = (value_prediction + 1) / 2
-            value_prediction = torch.clamp(value_prediction, min=0, max=1)
+            # Value-free policies (including LeHome) have no terminal value
+            # latent. Only decode it for checkpoints trained with that target.
+            value_prediction = None
+            if use_value_prediction:
+                value_indices = torch.full(
+                    (batch_size,), value_latent_idx, dtype=torch.int64,
+                    device=generated_latent_with_action.device,
+                )
+                value_prediction = extract_value_from_latent_sequence(
+                    generated_latent_with_action, value_indices
+                )
+                value_prediction = torch.clamp((value_prediction + 1) / 2, min=0, max=1)
 
         # Return full batch of samples, or just 1 sample if batch_size == 1
         if batch_size > 1:
@@ -1198,17 +1417,19 @@ def get_action(
                         future_image_predictions_i[k] = v[i]
                     future_image_predictions_list.append(future_image_predictions_i)
                 future_image_predictions = future_image_predictions_list
-                value_predictions_list = []
-                for i in range(batch_size):
-                    value_predictions_list.append(value_prediction[i].item())
-                value_prediction = value_predictions_list
+                if value_prediction is not None:
+                    value_predictions_list = []
+                    for i in range(batch_size):
+                        value_predictions_list.append(value_prediction[i].item())
+                    value_prediction = value_predictions_list
         else:
             # Single sample case
             actions = actions[0]
             actions = [actions[i] for i in range(len(actions))]
             if generate_future_state_and_value_in_parallel:
                 future_image_predictions = {k: v[0] for k, v in future_image_predictions.items() if v is not None}
-                value_prediction = value_prediction[0].item()
+                if value_prediction is not None:
+                    value_prediction = value_prediction[0].item()
 
         # Gather all results into a single return dict
         return_dict = dict(
@@ -1224,6 +1445,11 @@ def get_action(
                 future_image_latent_idx=future_image_latent_idx,
                 future_image2_latent_idx=future_image2_latent_idx,
                 value_latent_idx=value_latent_idx,
+                future_video_start_latent_idx=future_video_start_latent_idx,
+                future_video_end_latent_idx=future_video_end_latent_idx,
+                midpoint_wrist_image_latent_idx=midpoint_wrist_image_latent_idx,
+                midpoint_wrist_image2_latent_idx=midpoint_wrist_image2_latent_idx,
+                midpoint_image_latent_idx=midpoint_image_latent_idx,
             ),
             all_camera_images=all_camera_images,
             proprio=proprio,

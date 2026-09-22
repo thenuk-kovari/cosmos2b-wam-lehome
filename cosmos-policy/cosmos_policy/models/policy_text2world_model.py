@@ -173,6 +173,38 @@ def replace_latent_with_proprio(x0: torch.Tensor, proprio: torch.Tensor, proprio
     return new_x0
 
 
+def add_latent_ranges_to_mask(
+    mask_B_T: torch.Tensor,
+    batch_indices: torch.Tensor,
+    start_indices: torch.Tensor | None,
+    end_indices: torch.Tensor | None,
+) -> torch.Tensor:
+    """Enable inclusive per-sample temporal ranges in a loss mask.
+
+    A start/end value of -1 means that sample has no dense temporal target.
+    This is vectorized so it remains on-device during distributed training.
+    """
+
+    if start_indices is None or end_indices is None or batch_indices.numel() == 0:
+        return mask_B_T
+    starts = start_indices[batch_indices]
+    ends = end_indices[batch_indices]
+    valid = (starts >= 0) & (ends >= starts) & (ends < mask_B_T.shape[1])
+    if not torch.all(valid):
+        invalid = batch_indices[~valid]
+        raise ValueError(
+            f"Invalid dense future-video latent range for batch indices {invalid.tolist()}"
+        )
+    temporal = torch.arange(mask_B_T.shape[1], device=mask_B_T.device)
+    range_mask = (temporal[None, :] >= starts[:, None]) & (
+        temporal[None, :] <= ends[:, None]
+    )
+    mask_B_T[batch_indices] = torch.maximum(
+        mask_B_T[batch_indices], range_mask.to(mask_B_T.dtype)
+    )
+    return mask_B_T
+
+
 @attrs.define(slots=False)
 class CosmosPolicyModelConfig(BaseText2WorldModelConfig):
     """
@@ -291,6 +323,8 @@ class CosmosPolicyDiffusionModel(BaseDiffusionModel):
             future_image2_indices=(
                 data_batch["future_image2_latent_idx"] if "future_image2_latent_idx" in data_batch else None
             ),
+            future_video_start_indices=data_batch.get("future_video_start_latent_idx"),
+            future_video_end_indices=data_batch.get("future_video_end_latent_idx"),
             rollout_data_mask=data_batch["rollout_data_mask"],
             world_model_sample_mask=data_batch["world_model_sample_mask"],
             value_function_sample_mask=data_batch["value_function_sample_mask"],
@@ -323,6 +357,8 @@ class CosmosPolicyDiffusionModel(BaseDiffusionModel):
         future_wrist_image2_indices: Optional[torch.Tensor],
         future_image_indices: torch.Tensor,
         future_image2_indices: Optional[torch.Tensor],
+        future_video_start_indices: Optional[torch.Tensor],
+        future_video_end_indices: Optional[torch.Tensor],
         rollout_data_mask: torch.Tensor,
         world_model_sample_mask: torch.Tensor,
         value_function_sample_mask: torch.Tensor,
@@ -353,6 +389,8 @@ class CosmosPolicyDiffusionModel(BaseDiffusionModel):
             future_wrist_image_indices: indices for future wrist image latent frames
             future_wrist_image2_indices: indices for future wrist image #2 latent frames
             future_image_indices: indices for future primary image latent frames
+            future_video_start_indices: inclusive start of a dense future-video latent range
+            future_video_end_indices: inclusive end of a dense future-video latent range
             future_image2_indices: indices for future secondary image latent frames
             rollout_data_mask: mask for rollout vs demo data
             world_model_sample_mask: mask for world model samples
@@ -463,6 +501,17 @@ class CosmosPolicyDiffusionModel(BaseDiffusionModel):
                 world_batch_indices = (
                     torch.nonzero(world_idx_B, as_tuple=False).squeeze(-1).to(torch.long).to(sigma_B_T.device)
                 )
+                if (
+                    future_video_start_indices is not None
+                    and future_video_end_indices is not None
+                    and torch.all(future_video_start_indices[world_batch_indices] != -1)
+                ):
+                    mask_B_T = add_latent_ranges_to_mask(
+                        mask_B_T,
+                        world_batch_indices,
+                        future_video_start_indices,
+                        future_video_end_indices,
+                    )
                 if torch.all(future_image_indices != -1):  # -1 indicates future image is not used
                     mask_B_T[world_batch_indices, future_image_indices[world_batch_indices]] = 1
                 if future_image2_indices is not None and torch.all(
@@ -507,6 +556,17 @@ class CosmosPolicyDiffusionModel(BaseDiffusionModel):
                     torch.nonzero(demo_idx_B, as_tuple=False).squeeze(-1).to(torch.long).to(sigma_B_T.device)
                 )
                 mask_B_T[demo_batch_indices, action_indices[demo_batch_indices]] = 1
+                if (
+                    future_video_start_indices is not None
+                    and future_video_end_indices is not None
+                    and torch.all(future_video_start_indices[demo_batch_indices] != -1)
+                ):
+                    mask_B_T = add_latent_ranges_to_mask(
+                        mask_B_T,
+                        demo_batch_indices,
+                        future_video_start_indices,
+                        future_video_end_indices,
+                    )
                 if torch.all(future_image_indices != -1):  # -1 indicates future image is not used
                     mask_B_T[demo_batch_indices, future_image_indices[demo_batch_indices]] = 1
                 if future_image2_indices is not None and torch.all(
@@ -527,6 +587,17 @@ class CosmosPolicyDiffusionModel(BaseDiffusionModel):
                 world_batch_indices = (
                     torch.nonzero(world_idx_B, as_tuple=False).squeeze(-1).to(torch.long).to(sigma_B_T.device)
                 )
+                if (
+                    future_video_start_indices is not None
+                    and future_video_end_indices is not None
+                    and torch.all(future_video_start_indices[world_batch_indices] != -1)
+                ):
+                    mask_B_T = add_latent_ranges_to_mask(
+                        mask_B_T,
+                        world_batch_indices,
+                        future_video_start_indices,
+                        future_video_end_indices,
+                    )
                 if torch.all(future_image_indices != -1):  # -1 indicates future image is not used
                     mask_B_T[world_batch_indices, future_image_indices[world_batch_indices]] = 1
                 if future_image2_indices is not None and torch.all(
@@ -565,13 +636,43 @@ class CosmosPolicyDiffusionModel(BaseDiffusionModel):
         ):
             kendall_loss = kendall_loss * rearrange(final_mask_B_T, "b t -> b 1 t 1 1")
 
-        # Get losses for future third-person image prediction
-        if torch.all(future_image_indices != -1):  # -1 indicates future third-person image is not used
+        # Get losses for future third-person prediction. Dense-video datasets
+        # report this metric across the complete latent range, so the existing
+        # W&B future-image key measures all 60 output frames rather than only
+        # the endpoint.
+        has_dense_future_video = (
+            future_video_start_indices is not None
+            and future_video_end_indices is not None
+            and torch.all(future_video_start_indices != -1)
+        )
+        if has_dense_future_video:
+            lengths = future_video_end_indices - future_video_start_indices + 1
+            if not torch.all(lengths == lengths[0]):
+                raise ValueError("Dense future-video ranges must have equal lengths within a batch")
+            offsets = torch.arange(lengths[0], device=x0_B_C_T_H_W.device)
+            temporal_indices = future_video_start_indices[:, None] + offsets[None, :]
+            gather_indices = temporal_indices[:, None, :, None, None].expand(
+                -1,
+                x0_B_C_T_H_W.shape[1],
+                -1,
+                x0_B_C_T_H_W.shape[3],
+                x0_B_C_T_H_W.shape[4],
+            )
+            future_image_diff = torch.gather(
+                x0_B_C_T_H_W - model_pred.x0,
+                dim=2,
+                index=gather_indices,
+            )
+        elif torch.all(future_image_indices != -1):  # -1 indicates future third-person image is not used
             batch_indices = torch.arange(x0_B_C_T_H_W.shape[0], device=x0_B_C_T_H_W.device)
             future_image_diff = (
                 x0_B_C_T_H_W[batch_indices, :, future_image_indices, :, :]
                 - model_pred.x0[batch_indices, :, future_image_indices, :, :]
             )
+        else:
+            future_image_diff = None
+
+        if future_image_diff is not None:
             future_image_diff_demo = future_image_diff[rollout_data_mask == 0]
             future_image_diff_world_model = future_image_diff[world_model_sample_mask == 1]
             future_image_diff_value_function = future_image_diff[value_function_sample_mask == 1]

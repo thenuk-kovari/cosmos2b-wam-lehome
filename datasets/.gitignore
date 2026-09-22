@@ -4,3 +4,9 @@
 !README.md
 !lehome_selection.json
 !pull_lehome.sh
+
+# Normalization statistics are small, required runtime inputs. Keep them in Git
+# while continuing to ignore downloaded LeHome parquet/video payloads.
+!lehome/
+lehome/*
+!lehome/lehome_cosmos_stats*.json

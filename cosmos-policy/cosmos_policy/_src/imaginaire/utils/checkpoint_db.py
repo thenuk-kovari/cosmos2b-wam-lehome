@@ -910,9 +910,12 @@ def get_checkpoint_by_s3(checkpoint_s3: str) -> CheckpointConfig:
     return _CHECKPOINTS_BY_S3[checkpoint_s3]
 
 
-@functools.lru_cache
 def get_checkpoint_by_hf(checkpoint_hf: str) -> str:
     """Download checkpoint from HuggingFace and return local path."""
+    checkpoint_override = os.environ.get("COSMOS_POLICY_CHECKPOINT_OVERRIDE")
+    if checkpoint_override:
+        log.info(f"Using explicit checkpoint override: {checkpoint_override}")
+        return checkpoint_override
     # Parse hf://org/repo/path/to/file.pth
     assert checkpoint_hf.startswith("hf://"), f"Not a HuggingFace URI: {checkpoint_hf}"
     hf_path = checkpoint_hf[5:]  # Remove "hf://" prefix

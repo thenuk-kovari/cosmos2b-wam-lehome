@@ -2,8 +2,9 @@
 
 The source data follows the LeRobot v3 layout: proprioception is stored in
 Parquet shards while each camera is one concatenated MP4 per garment variant.
-This loader reads only the selected episodes, constructs executable q0-anchored
-joint-delta chunks, and randomly seeks only the current/future video frames.
+This loader reads only the selected episodes and constructs executable
+q0-anchored joint-delta chunks. Its dense-video mode supplies every future
+top-camera frame aligned with the 60-step action horizon.
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import pickle
+from collections import OrderedDict
 from pathlib import Path
 
 import av
@@ -22,6 +24,32 @@ from torch.utils.data import Dataset
 
 from cosmos_policy.datasets.dataset_common import calculate_epoch_structure, determine_sample_type
 from cosmos_policy.datasets.dataset_utils import preprocess_image
+from cosmos_policy.lehome_dual_endpoint_layout import (
+    ACTION_LATENT_IDX as DUAL_ENDPOINT_ACTION_LATENT_IDX,
+    ENDPOINT_HEAD_LATENT_IDX,
+    ENDPOINT_LEFT_LATENT_IDX,
+    ENDPOINT_RIGHT_LATENT_IDX,
+    FUTURE_IMAGE_END_LATENT_IDX,
+    FUTURE_IMAGE_START_LATENT_IDX,
+    FUTURE_PROPRIO_LATENT_IDX as DUAL_ENDPOINT_FUTURE_PROPRIO_LATENT_IDX,
+    MIDPOINT_HEAD_LATENT_IDX,
+    MIDPOINT_LEFT_LATENT_IDX,
+    MIDPOINT_RIGHT_LATENT_IDX,
+    MIDPOINT_STEP,
+    RAW_SEQUENCE_FRAMES as DUAL_ENDPOINT_RAW_SEQUENCE_FRAMES,
+    build_dual_endpoint_raw_sequence,
+    validate_dual_endpoint_layout_parameters,
+)
+from cosmos_policy.lehome_layout import (
+    ACTION_CHUNK_SIZE,
+    ACTION_LATENT_IDX,
+    FUTURE_VIDEO_END_LATENT_IDX,
+    FUTURE_VIDEO_START_LATENT_IDX,
+    STATE_T,
+    VIDEO_FPS,
+    build_dense_video_raw_sequence,
+    validate_dense_layout_parameters,
+)
 
 TASK_PROMPTS = {
     "record_pant_long_release_10": "fold the pants",
@@ -49,6 +77,10 @@ class _PyAVVideoReader:
         self.path = path
         self.container = av.open(path)
         self.stream = self.container.streams.video[0]
+        # libdav1d otherwise sizes a decoder thread pool from the host CPU
+        # count for every open stream. With distributed DataLoader workers,
+        # that multiplies into hundreds of threads and large decoder heaps.
+        self.stream.codec_context.thread_count = 1
         rate = self.stream.average_rate or self.stream.guessed_rate
         if rate is None or self.stream.time_base is None:
             raise RuntimeError(f"Missing frame-rate metadata in {path}")
@@ -63,6 +95,15 @@ class _PyAVVideoReader:
 
     def __len__(self) -> int:
         return self.length
+
+    def close(self) -> None:
+        container = getattr(self, "container", None)
+        if container is not None:
+            container.close()
+            self.container = None
+
+    def __del__(self) -> None:
+        self.close()
 
     def get_batch(self, indices: list[int]) -> np.ndarray:
         requested = [int(index) for index in indices]
@@ -115,7 +156,7 @@ def _apply_conditioning_dropout(values: np.ndarray, probability: float) -> tuple
 
 
 class LeHomeDataset(Dataset):
-    """Selected LeHome episodes in the latent-frame layout used by ALOHA."""
+    """Selected LeHome episodes in endpoint, dual-endpoint, or dense layout."""
 
     def __init__(
         self,
@@ -133,6 +174,9 @@ class LeHomeDataset(Dataset):
         num_duplicates_per_image: int = 4,
         demonstration_sampling_prob: float = 0.75,
         proprio_conditioning_dropout_prob: float = 0.0,
+        predict_dense_video: bool = False,
+        predict_midpoint_images: bool = False,
+        max_open_video_readers: int = 3,
         debug: bool = False,
         # Compatibility options inherited when Hydra recursively merges this
         # dataset over the LIBERO experiment. LeHome always uses proprio and
@@ -152,6 +196,18 @@ class LeHomeDataset(Dataset):
             raise ValueError("demonstration_sampling_prob must be strictly between 0 and 1")
         if not 0.0 <= proprio_conditioning_dropout_prob <= 1.0:
             raise ValueError("proprio_conditioning_dropout_prob must be between 0 and 1")
+        if predict_dense_video and predict_midpoint_images:
+            raise ValueError(
+                "predict_dense_video and predict_midpoint_images are mutually exclusive"
+            )
+        if predict_dense_video:
+            validate_dense_layout_parameters(chunk_size, num_duplicates_per_image)
+        if predict_midpoint_images:
+            validate_dual_endpoint_layout_parameters(
+                chunk_size, num_duplicates_per_image
+            )
+        if max_open_video_readers < 3:
+            raise ValueError("max_open_video_readers must be at least 3 for the three LeHome cameras")
 
         self.data_dir = Path(data_dir)
         self.split = split
@@ -165,8 +221,11 @@ class LeHomeDataset(Dataset):
         self.num_duplicates_per_image = num_duplicates_per_image
         self.demonstration_sampling_prob = demonstration_sampling_prob
         self.proprio_conditioning_dropout_prob = proprio_conditioning_dropout_prob
+        self.predict_dense_video = predict_dense_video
+        self.predict_midpoint_images = predict_midpoint_images
+        self.max_open_video_readers = max_open_video_readers
         self.debug = debug
-        self._video_readers: dict[str, _PyAVVideoReader] = {}
+        self._video_readers: OrderedDict[str, _PyAVVideoReader] = OrderedDict()
 
         # These arguments deliberately have no effect for LeHome. Keeping them
         # in the signature makes the adapter safe to instantiate from the
@@ -225,8 +284,12 @@ class LeHomeDataset(Dataset):
 
     def __getstate__(self):
         state = self.__dict__.copy()
-        state["_video_readers"] = {}
+        state["_video_readers"] = OrderedDict()
         return state
+
+    def __del__(self) -> None:
+        for reader in getattr(self, "_video_readers", {}).values():
+            reader.close()
 
     def _load_episodes(self, variants: tuple[str, ...], episode_indices: tuple[int, ...]) -> list[dict]:
         episodes = []
@@ -352,9 +415,14 @@ class LeHomeDataset(Dataset):
         }
 
     def _get_video_reader(self, path: str) -> _PyAVVideoReader:
-        if path not in self._video_readers:
-            self._video_readers[path] = _PyAVVideoReader(path)
-        return self._video_readers[path]
+        reader = self._video_readers.pop(path, None)
+        if reader is None:
+            while len(self._video_readers) >= self.max_open_video_readers:
+                _, stale_reader = self._video_readers.popitem(last=False)
+                stale_reader.close()
+            reader = _PyAVVideoReader(path)
+        self._video_readers[path] = reader
+        return reader
 
     def _read_current_and_future_frames(self, episode: dict, current: int, future: int) -> dict[str, np.ndarray]:
         source_indices = [int(episode["video_indices"][current]), int(episode["video_indices"][future])]
@@ -366,6 +434,75 @@ class LeHomeDataset(Dataset):
             decoded = reader.get_batch(source_indices)
             result[f"{camera_name}_current"] = decoded[0]
             result[f"{camera_name}_future"] = decoded[1]
+        return result
+
+    def _read_current_midpoint_and_future_frames(
+        self,
+        episode: dict,
+        current: int,
+        midpoint: int,
+        future: int,
+    ) -> dict[str, np.ndarray]:
+        """Decode aligned current, t+15, and t+30 frames from all cameras."""
+
+        relative_indices = (current, midpoint, future)
+        source_indices = [
+            int(episode["video_indices"][index]) for index in relative_indices
+        ]
+        result: dict[str, np.ndarray] = {}
+        for camera_name, path in episode["video_paths"].items():
+            reader = self._get_video_reader(path)
+            if max(source_indices) >= len(reader):
+                raise IndexError(
+                    f"Video index {max(source_indices)} is out of range for "
+                    f"{path} ({len(reader)} frames)"
+                )
+            decoded = reader.get_batch(source_indices)
+            result[f"{camera_name}_current"] = decoded[0]
+            result[f"{camera_name}_midpoint"] = decoded[1]
+            result[f"{camera_name}_future"] = decoded[2]
+        return result
+
+    def _read_current_frames_and_future_top_video(
+        self,
+        episode: dict,
+        current: int,
+    ) -> dict[str, np.ndarray]:
+        """Decode current three-camera context plus top frames t+1..t+60."""
+
+        future_relative_indices = np.minimum(
+            current + np.arange(1, ACTION_CHUNK_SIZE + 1),
+            episode["num_steps"] - 1,
+        )
+        current_source_idx = int(episode["video_indices"][current])
+        result: dict[str, np.ndarray] = {}
+        for camera_name in ("left", "right"):
+            path = episode["video_paths"][camera_name]
+            reader = self._get_video_reader(path)
+            if current_source_idx >= len(reader):
+                raise IndexError(
+                    f"Video index {current_source_idx} is out of range for {path} ({len(reader)} frames)"
+                )
+            result[f"{camera_name}_current"] = reader.get_batch([current_source_idx])[0]
+
+        top_path = episode["video_paths"]["top"]
+        top_reader = self._get_video_reader(top_path)
+        top_source_indices = [current_source_idx] + [
+            int(episode["video_indices"][index]) for index in future_relative_indices
+        ]
+        if max(top_source_indices) >= len(top_reader):
+            raise IndexError(
+                f"Video index {max(top_source_indices)} is out of range for "
+                f"{top_path} ({len(top_reader)} frames)"
+            )
+        top_frames = top_reader.get_batch(top_source_indices)
+        result["top_current"] = top_frames[0]
+        result["top_future_video"] = top_frames[1:]
+        if result["top_future_video"].shape[0] != ACTION_CHUNK_SIZE:
+            raise AssertionError(
+                "Dense LeHome decoding must return exactly "
+                f"{ACTION_CHUNK_SIZE} future frames"
+            )
         return result
 
     def __len__(self) -> int:
@@ -388,6 +525,9 @@ class LeHomeDataset(Dataset):
         episode = self.episodes[episode_idx]
         states = episode["states"]
         future_frame_idx = min(relative_step_idx + self.chunk_size, len(states) - 1)
+        midpoint_frame_idx = min(
+            relative_step_idx + MIDPOINT_STEP, len(states) - 1
+        )
         next_relative_step_idx = future_frame_idx
 
         action_chunk = _anchored_delta_chunk(states, relative_step_idx, self.chunk_size)
@@ -416,35 +556,144 @@ class LeHomeDataset(Dataset):
             proprio, self.proprio_conditioning_dropout_prob
         )
 
-        decoded = self._read_current_and_future_frames(episode, relative_step_idx, future_frame_idx)
-        blank = np.zeros_like(decoded["top_current"])
-        unique_frames = np.stack(
-            [
-                blank,
-                blank,
+        if self.predict_dense_video:
+            decoded = self._read_current_frames_and_future_top_video(
+                episode, relative_step_idx
+            )
+            raw_frames = build_dense_video_raw_sequence(
                 decoded["left_current"],
                 decoded["right_current"],
                 decoded["top_current"],
-                blank,
-                blank,
+                decoded["top_future_video"],
+            )
+            # preprocess_image samples one spatial/color transform and applies
+            # it to the whole sequence, preserving temporal motion coherence.
+            all_images = preprocess_image(
+                raw_frames,
+                final_image_size=self.final_image_size,
+                normalize_images=self.normalize_images,
+                use_image_aug=self.use_image_aug,
+                stronger_image_aug=self.use_stronger_image_aug,
+            )
+            expected_raw_frames = 1 + self.num_duplicates_per_image * (STATE_T - 1)
+            if all_images.shape[1] != expected_raw_frames:
+                raise AssertionError(
+                    f"Dense LeHome sample has {all_images.shape[1]} raw frames, "
+                    f"expected {expected_raw_frames}"
+                )
+        elif self.predict_midpoint_images:
+            decoded = self._read_current_midpoint_and_future_frames(
+                episode,
+                relative_step_idx,
+                midpoint_frame_idx,
+                future_frame_idx,
+            )
+            raw_frames = build_dual_endpoint_raw_sequence(
+                decoded["left_current"],
+                decoded["right_current"],
+                decoded["top_current"],
+                decoded["left_midpoint"],
+                decoded["right_midpoint"],
+                decoded["top_midpoint"],
                 decoded["left_future"],
                 decoded["right_future"],
                 decoded["top_future"],
-            ]
-        ).astype(np.uint8, copy=False)
-        unique_frames = preprocess_image(
-            unique_frames,
-            final_image_size=self.final_image_size,
-            normalize_images=self.normalize_images,
-            use_image_aug=self.use_image_aug,
-            stronger_image_aug=self.use_stronger_image_aug,
-        )
-        repeats = torch.tensor([1] + [self.num_duplicates_per_image] * 9, dtype=torch.long)
-        all_images = torch.repeat_interleave(unique_frames, repeats, dim=1)
+            )
+            all_images = preprocess_image(
+                raw_frames,
+                final_image_size=self.final_image_size,
+                normalize_images=self.normalize_images,
+                use_image_aug=self.use_image_aug,
+                stronger_image_aug=self.use_stronger_image_aug,
+            )
+            if all_images.shape[1] != DUAL_ENDPOINT_RAW_SEQUENCE_FRAMES:
+                raise AssertionError(
+                    f"Dual-endpoint LeHome sample has {all_images.shape[1]} "
+                    f"raw frames, expected {DUAL_ENDPOINT_RAW_SEQUENCE_FRAMES}"
+                )
+        else:
+            decoded = self._read_current_and_future_frames(
+                episode, relative_step_idx, future_frame_idx
+            )
+            blank = np.zeros_like(decoded["top_current"])
+            unique_frames = np.stack(
+                [
+                    blank,
+                    blank,
+                    decoded["left_current"],
+                    decoded["right_current"],
+                    decoded["top_current"],
+                    blank,
+                    blank,
+                    decoded["left_future"],
+                    decoded["right_future"],
+                    decoded["top_future"],
+                ]
+            ).astype(np.uint8, copy=False)
+            unique_frames = preprocess_image(
+                unique_frames,
+                final_image_size=self.final_image_size,
+                normalize_images=self.normalize_images,
+                use_image_aug=self.use_image_aug,
+                stronger_image_aug=self.use_stronger_image_aug,
+            )
+            repeats = torch.tensor([1] + [self.num_duplicates_per_image] * 9, dtype=torch.long)
+            all_images = torch.repeat_interleave(unique_frames, repeats, dim=1)
 
         if self.t5_text_embeddings is None:
             raise RuntimeError("LeHome T5 embeddings are required before training or sampling the dataset")
         text_embedding = torch.squeeze(self.t5_text_embeddings[episode["command"]])
+
+        if self.predict_dense_video:
+            latent_indices = {
+                "action_latent_idx": ACTION_LATENT_IDX,
+                "value_latent_idx": -1,
+                "current_proprio_latent_idx": 1,
+                "current_wrist_image_latent_idx": 2,
+                "current_wrist_image2_latent_idx": 3,
+                "current_image_latent_idx": 4,
+                "future_proprio_latent_idx": -1,
+                "future_wrist_image_latent_idx": -1,
+                "future_wrist_image2_latent_idx": -1,
+                # The legacy metric key points at the final predicted video
+                # latent. Diffusion loss still covers all slots 5 through 19.
+                "future_image_latent_idx": FUTURE_VIDEO_END_LATENT_IDX,
+                "future_video_start_latent_idx": FUTURE_VIDEO_START_LATENT_IDX,
+                "future_video_end_latent_idx": FUTURE_VIDEO_END_LATENT_IDX,
+            }
+        elif self.predict_midpoint_images:
+            latent_indices = {
+                "action_latent_idx": DUAL_ENDPOINT_ACTION_LATENT_IDX,
+                "value_latent_idx": -1,
+                "current_proprio_latent_idx": 1,
+                "current_wrist_image_latent_idx": 2,
+                "current_wrist_image2_latent_idx": 3,
+                "current_image_latent_idx": 4,
+                "future_proprio_latent_idx": DUAL_ENDPOINT_FUTURE_PROPRIO_LATENT_IDX,
+                "future_wrist_image_latent_idx": ENDPOINT_LEFT_LATENT_IDX,
+                "future_wrist_image2_latent_idx": ENDPOINT_RIGHT_LATENT_IDX,
+                "future_image_latent_idx": ENDPOINT_HEAD_LATENT_IDX,
+                "midpoint_wrist_image_latent_idx": MIDPOINT_LEFT_LATENT_IDX,
+                "midpoint_wrist_image2_latent_idx": MIDPOINT_RIGHT_LATENT_IDX,
+                "midpoint_image_latent_idx": MIDPOINT_HEAD_LATENT_IDX,
+                "future_video_start_latent_idx": FUTURE_IMAGE_START_LATENT_IDX,
+                "future_video_end_latent_idx": FUTURE_IMAGE_END_LATENT_IDX,
+            }
+        else:
+            latent_indices = {
+                "action_latent_idx": 5,
+                "value_latent_idx": -1,
+                "current_proprio_latent_idx": 1,
+                "current_wrist_image_latent_idx": 2,
+                "current_wrist_image2_latent_idx": 3,
+                "current_image_latent_idx": 4,
+                "future_proprio_latent_idx": 6,
+                "future_wrist_image_latent_idx": 7,
+                "future_wrist_image2_latent_idx": 8,
+                "future_image_latent_idx": 9,
+                "future_video_start_latent_idx": -1,
+                "future_video_end_latent_idx": -1,
+            }
 
         return {
             "video": all_images,
@@ -452,7 +701,7 @@ class LeHomeDataset(Dataset):
             "actions": action_chunk,
             "t5_text_embeddings": text_embedding,
             "t5_text_mask": torch.ones(512, dtype=torch.int64),
-            "fps": 16,
+            "fps": VIDEO_FPS if (self.predict_dense_video or self.predict_midpoint_images) else 16,
             "padding_mask": torch.zeros(1, self.final_image_size, self.final_image_size),
             "image_size": self.final_image_size * torch.ones(4),
             "proprio": proprio,
@@ -467,14 +716,5 @@ class LeHomeDataset(Dataset):
             "world_model_sample_mask": 1 if is_world_model_sample else 0,
             "value_function_sample_mask": 0,
             "global_rollout_idx": global_rollout_idx,
-            "action_latent_idx": 5,
-            "value_latent_idx": -1,
-            "current_proprio_latent_idx": 1,
-            "current_wrist_image_latent_idx": 2,
-            "current_wrist_image2_latent_idx": 3,
-            "current_image_latent_idx": 4,
-            "future_proprio_latent_idx": 6,
-            "future_wrist_image_latent_idx": 7,
-            "future_wrist_image2_latent_idx": 8,
-            "future_image_latent_idx": 9,
+            **latent_indices,
         }

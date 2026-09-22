@@ -40,6 +40,13 @@ def init_wandb(config: Config, model: ImaginaireModel) -> None:
         config (Config): The config object for the Imaginaire codebase.
         model (ImaginaireModel): The PyTorch model.
     """
+    # Multiple W&B callbacks are active in the Cosmos trainer. Reusing the
+    # process-global run prevents a later callback from generating and
+    # persisting a different ID while wandb itself keeps the first run alive.
+    if wandb.run is not None:
+        log.info(f"Reusing active wandb run: {wandb.run.id}")
+        return
+
     if isinstance(config.job, DictConfig):
         from cosmos_policy._src.imaginaire.config import JobConfig
 
@@ -108,11 +115,15 @@ def _write_wandb_id(config_job: JobConfig, config_checkpoint: CheckpointConfig, 
         wandb_id (str): The W&B job ID.
     """
     content = f"{wandb_id}\n"
+    # Always retain a local copy. A second callback in the same process and a
+    # restart on the same machine both read this path when object-store loading
+    # is disabled, even if checkpoint saving to object storage is enabled.
+    os.makedirs(config_job.path_local, exist_ok=True)
+    wandb_id_path_local = f"{config_job.path_local}/wandb_id.txt"
+    with open(wandb_id_path_local, "w") as file:
+        file.write(content)
+
     if config_checkpoint.save_to_object_store.enabled:
         object_store_saver = object_store.ObjectStore(config_checkpoint.save_to_object_store)
         wandb_id_path = f"{config_job.path}/wandb_id.txt"
         object_store_saver.save_object(content, key=wandb_id_path, type="text")
-    else:
-        wandb_id_path = f"{config_job.path_local}/wandb_id.txt"
-        with open(wandb_id_path, "w") as file:
-            file.write(content)
