@@ -22,6 +22,8 @@ def main():
     state_t = int(os.environ.get("JOINTLOSS_PREFLIGHT_STATE_T", "10"))
     image_start = int(os.environ.get("JOINTLOSS_PREFLIGHT_IMAGE_START", "-1"))
     image_end = int(os.environ.get("JOINTLOSS_PREFLIGHT_IMAGE_END", "-1"))
+    image_multiplier = float(os.environ.get("JOINTLOSS_PREFLIGHT_IMAGE_MULTIPLIER", "1"))
+    loss_scale = float(os.environ.get("JOINTLOSS_PREFLIGHT_LOSS_SCALE", "10"))
     if f"trainer.max_iter={max_iter}" not in sys.argv:
         raise ValueError(f"Preflight must be bounded by trainer.max_iter={max_iter}")
     original = CosmosPolicyDiffusionModel.compute_loss_with_epsilon_and_sigma
@@ -38,8 +40,13 @@ def main():
         output, loss, mse, edm = result
         assert loss.shape[2] == state_t
         assert self.config.action_loss_multiplier == 1
+        assert self.config.future_image_loss_multiplier == image_multiplier
+        assert self.config.loss_scale == loss_scale
         assert not self.config.mask_loss_for_action_future_state_prediction
-        torch.testing.assert_close(loss, edm, rtol=0, atol=0)
+        expected_loss = edm.clone()
+        if image_start >= 0:
+            expected_loss[:, :, image_start : image_end + 1] *= image_multiplier
+        torch.testing.assert_close(loss, expected_loss, rtol=0, atol=0)
         world = bound["world_model_sample_mask"].bool()
         expected = torch.zeros((loss.shape[0], state_t), dtype=torch.bool, device=loss.device)
         expected[:, 5:] = True
@@ -72,6 +79,8 @@ def main():
                 "state_supervised_slots": list(range(6, state_t)),
                 "image_supervised_slots": list(range(image_start, image_end + 1)) if image_start >= 0 else None,
                 "action_multiplier": 1,
+                "image_multiplier": image_multiplier,
+                "loss_scale": loss_scale,
             }), flush=True)
 
         def check_gradient(gradient):

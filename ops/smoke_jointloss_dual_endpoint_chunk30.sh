@@ -20,6 +20,8 @@ exec sudo -n docker run --rm --gpus all --ipc=host \
     -e JOINTLOSS_PREFLIGHT_STATE_T=13 \
     -e JOINTLOSS_PREFLIGHT_IMAGE_START=7 \
     -e JOINTLOSS_PREFLIGHT_IMAGE_END=12 \
+    -e JOINTLOSS_PREFLIGHT_IMAGE_MULTIPLIER=0.5 \
+    -e JOINTLOSS_PREFLIGHT_LOSS_SCALE=13 \
     -e TORCH_NCCL_ASYNC_ERROR_HANDLING=1 \
     -v "${repo_dir}:/workspace" \
     -v /home/ubuntu/.cache/cosmos:/home/ubuntu/.cache \

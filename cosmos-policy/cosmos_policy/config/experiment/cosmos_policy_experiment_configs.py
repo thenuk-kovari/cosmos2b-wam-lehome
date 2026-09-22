@@ -602,7 +602,7 @@ cosmos_predict2_2b_480p_lehome_100_demos_endpoint_dropout50 = LazyDict(
 # Policy: p(actions, future state | current state).
 # World model: p(future state | current state, ground-truth actions).
 # The 75/25 ratio selects conditioning patterns, NOT scalar loss weights.
-# All unconditioned latent elements use the original sigma-weighted EDM MSE.
+# All unconditioned elements use the inherited rectified-flow-weighted MSE.
 cosmos_predict2_2b_480p_lehome_100_demos_endpoint_jointloss_dropout50 = LazyDict(
     dict(
         defaults=[
@@ -723,9 +723,10 @@ cosmos_predict2_2b_480p_lehome_100_demos_endpoint_jointloss_dropout50_chunk30_in
 )
 
 # One-second action horizon with visual supervision at both 0.5 s and 1.0 s.
-# This changes only the input/target layout. It inherits the exact joint EDM
-# objective, 75/25 conditioning-pattern sampler, optimizer, scheduler, and
+# It inherits the joint rectified-flow objective, 75/25 conditioning-pattern
+# sampler, optimizer, scheduler, and
 # 50% current-proprio dropout from the proven one-second endpoint experiment.
+# Image weights and loss scale below preserve the old absolute modality weights.
 lehome_dual_endpoint_chunk30_train_dataset = L(LeHomeDataset)(
     data_dir=lehome_data_dir,
     split="train",
@@ -769,9 +770,13 @@ cosmos_predict2_2b_480p_lehome_100_demos_dual_endpoint_jointloss_dropout50_chunk
         ],
         model=L(CosmosPolicyVideo2WorldModel)(
             config=dict(
+                # Preserve the old 10-slot run's absolute modality weights:
+                # 13/13 for action/proprio and 0.5 per each of six images.
+                loss_scale=13.0,
                 state_t=LEHOME_DUAL_ENDPOINT_STATE_T,
                 min_num_conditional_frames=LEHOME_DUAL_ENDPOINT_NUM_CONDITIONAL_LATENTS,
                 max_num_conditional_frames=LEHOME_DUAL_ENDPOINT_NUM_CONDITIONAL_LATENTS,
+                future_image_loss_multiplier=0.5,
                 tokenizer=dict(
                     chunk_duration=LEHOME_DUAL_ENDPOINT_RAW_SEQUENCE_FRAMES,
                 ),

@@ -240,8 +240,14 @@ class CosmosPolicyModelConfig(BaseText2WorldModelConfig):
     # (Must be an integer - or will be cast to an integer later!)
     action_loss_multiplier: int = 1
 
+    # Multiplier applied to every future-image latent slot. This permits adding
+    # more visual target times without silently increasing total image weight.
+    future_image_loss_multiplier: float = 1.0
+
     def __attrs_post_init__(self):
         super().__attrs_post_init__()
+        if self.future_image_loss_multiplier <= 0:
+            raise ValueError("future_image_loss_multiplier must be positive")
         assert not (
             self.mask_loss_for_action_future_state_prediction and self.mask_value_prediction_loss_for_policy_prediction
         ), (
@@ -456,7 +462,9 @@ class CosmosPolicyDiffusionModel(BaseDiffusionModel):
 
         # Construct mask to support masking out loss (or scaling it by some multiplier) for different types of predictions
         B, T = x0_B_C_T_H_W.shape[0], x0_B_C_T_H_W.shape[2]
-        final_mask_B_T = torch.ones((B, T), dtype=torch.long, device=sigma_B_T.device)  # All 1s mask initially
+        final_mask_B_T = torch.ones(
+            (B, T), dtype=torch.float32, device=sigma_B_T.device
+        )
 
         # If using input masking for value prediction, mask out the loss for everything except the value prediction
         # This is necessary since otherwise the loss will be computed for all latent frames, not just the value prediction frame
@@ -621,6 +629,49 @@ class CosmosPolicyDiffusionModel(BaseDiffusionModel):
                 self.config.action_loss_multiplier
             )
 
+        if self.config.future_image_loss_multiplier != 1.0:
+            image_mask_B_T = torch.zeros(
+                (B, T), dtype=torch.bool, device=sigma_B_T.device
+            )
+            if (
+                future_video_start_indices is not None
+                and future_video_end_indices is not None
+            ):
+                starts = future_video_start_indices.to(sigma_B_T.device)
+                ends = future_video_end_indices.to(sigma_B_T.device)
+                valid_ranges = (starts >= 0) & (ends >= starts) & (ends < T)
+                malformed_ranges = ((starts >= 0) | (ends >= 0)) & ~valid_ranges
+                if torch.any(malformed_ranges):
+                    raise ValueError("Invalid future-image latent range for loss weighting")
+                temporal = torch.arange(T, device=sigma_B_T.device)
+                image_mask_B_T |= (
+                    valid_ranges[:, None]
+                    & (temporal[None, :] >= starts[:, None])
+                    & (temporal[None, :] <= ends[:, None])
+                )
+
+            for indices in (
+                future_wrist_image_indices,
+                future_wrist_image2_indices,
+                future_image_indices,
+                future_image2_indices,
+            ):
+                if indices is None:
+                    continue
+                indices = indices.to(sigma_B_T.device)
+                valid = (indices >= 0) & (indices < T)
+                image_mask_B_T[batch_indices[valid], indices[valid]] = True
+
+            if not torch.any(image_mask_B_T):
+                raise ValueError(
+                    "future_image_loss_multiplier was set but no image slots were found"
+                )
+            final_mask_B_T = torch.where(
+                image_mask_B_T,
+                final_mask_B_T * self.config.future_image_loss_multiplier,
+                final_mask_B_T,
+            )
+
         # extra loss mask for each sample, for example, human faces, hands
         pred_mse_B_C_T_H_W = (x0_B_C_T_H_W - model_pred.x0) ** 2
         edm_loss_B_C_T_H_W = pred_mse_B_C_T_H_W * rearrange(weights_per_sigma_B_T, "b t -> b 1 t 1 1")
@@ -633,6 +684,7 @@ class CosmosPolicyDiffusionModel(BaseDiffusionModel):
             or self.config.mask_current_state_action_for_value_prediction
             or self.config.mask_future_state_for_qvalue_prediction
             or self.config.action_loss_multiplier != 1
+            or self.config.future_image_loss_multiplier != 1.0
         ):
             kendall_loss = kendall_loss * rearrange(final_mask_B_T, "b t -> b 1 t 1 1")
 

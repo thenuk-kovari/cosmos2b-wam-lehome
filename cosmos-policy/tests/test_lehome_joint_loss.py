@@ -93,7 +93,7 @@ def test_chunk30_changes_only_horizon_stats_and_run_name(config, chunk30_config)
     assert new_job.pop("name") == CHUNK30_EXPERIMENT
     assert new_job == old_job
 
-def test_dual_endpoint_changes_layout_but_not_loss(
+def test_dual_endpoint_changes_layout_and_preserves_old_modality_weights(
     chunk30_config, dual_endpoint_config
 ):
     old_model = chunk30_config.model.config
@@ -109,6 +109,11 @@ def test_dual_endpoint_changes_layout_but_not_loss(
     )
     for field in unchanged_loss_fields:
         assert getattr(new_model, field) == getattr(old_model, field), field
+    assert old_model.scaling == new_model.scaling == "rectified_flow"
+    assert old_model.loss_scale == 10.0
+    assert new_model.loss_scale == 13.0
+    assert old_model.future_image_loss_multiplier == 1.0
+    assert new_model.future_image_loss_multiplier == 0.5
 
     assert new_model.state_t == 13
     assert new_model.min_num_conditional_frames == 5
@@ -147,6 +152,10 @@ def test_resolved_training_contract(config):
     assert model.mask_current_state_action_for_value_prediction is False
     assert model.mask_future_state_for_qvalue_prediction is False
     assert model.action_loss_multiplier == 1
+    assert model.future_image_loss_multiplier == 1.0
+    assert model.scaling == "rectified_flow"
+    assert model.sigma_data == 1.0
+    assert model.loss_scale == 10.0
     assert model.denoise_replace_gt_frames is True
     assert model.state_t == 10
     assert model.min_num_conditional_frames == model.max_num_conditional_frames == 5
@@ -257,8 +266,7 @@ def test_dual_endpoint_loss_and_gradients_cover_t15_and_t30_images(
 ):
     shape = (4, 16, 13, 8, 8)
     clean = torch.zeros(shape)
-    slot_values = torch.arange(13, dtype=torch.float32).reshape(1, 1, 13, 1, 1)
-    network_output = slot_values.expand(shape).clone().requires_grad_()
+    network_output = torch.ones(shape, requires_grad=True)
     condition_mask = torch.zeros((4, 1, 13, 8, 8))
     condition_mask[:, :, :5] = 1
     condition_mask[3, :, 5] = 1
@@ -270,8 +278,7 @@ def test_dual_endpoint_loss_and_gradients_cover_t15_and_t30_images(
         to_dict=lambda: {},
     )
     sigma = torch.full((4, 1), sigma_value)
-    sigma_data = float(dual_endpoint_config.model.config.sigma_data)
-    weight = (sigma.square() + sigma_data**2) / (sigma * sigma_data).square()
+    weight = (1 + sigma).square() / sigma.square()
     fake = SimpleNamespace(
         config=dual_endpoint_config.model.config,
         tensor_kwargs={"dtype": torch.float32, "device": "cpu"},
@@ -315,22 +322,36 @@ def test_dual_endpoint_loss_and_gradients_cover_t15_and_t30_images(
             value_indices=idx(-1),
         )
     )
-    expected_mse = network_output.detach().square()
-    expected_mse = expected_mse * (1 - condition_mask).expand_as(clean)
+    expected_mse = (1 - condition_mask).expand_as(clean)
+    expected_edm = expected_mse * weight[:, None, :, None, None]
+    expected_loss = expected_edm.clone()
+    expected_loss[:, :, 7:13] *= 0.5
     torch.testing.assert_close(mse, expected_mse)
-    torch.testing.assert_close(
-        loss, expected_mse * weight[:, None, :, None, None]
-    )
-    torch.testing.assert_close(loss, edm)
+    torch.testing.assert_close(edm, expected_edm)
+    torch.testing.assert_close(loss, expected_loss)
     expected_image_metric = expected_mse[:3, :, 7:13].mean()
     torch.testing.assert_close(
         output["demo_sample_future_image_mse_loss"], expected_image_metric
     )
 
+    # Three policy plus one state sample, all slot MSEs equal to one:
+    # ((3 * (action 1 + proprio 1 + images 6 * 0.5))
+    #   + (proprio 1 + images 6 * 0.5)) / 4 = 4.75.
+    final_training_loss = loss.mean() * dual_endpoint_config.model.config.loss_scale
+    torch.testing.assert_close(final_training_loss, weight.squeeze().mean() * 4.75)
+
     loss.mean().backward()
     per_slot = network_output.grad.abs().sum(dim=(1, 3, 4))
     assert torch.all(per_slot[:3, 5:13] > 0)
     assert torch.all(per_slot[3, 6:13] > 0)
+    torch.testing.assert_close(
+        per_slot[:3, 7:13],
+        (per_slot[:3, 6:7] * 0.5).expand(-1, 6),
+    )
+    torch.testing.assert_close(
+        per_slot[3:, 7:13],
+        (per_slot[3:, 6:7] * 0.5).expand(-1, 6),
+    )
     assert torch.all(per_slot[:, 7:10] > 0)
     assert torch.all(per_slot[:, 10:13] > 0)
     assert torch.all(per_slot[:, :5] == 0)
